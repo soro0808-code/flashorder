@@ -807,7 +807,7 @@ footer a:hover{color:var(--ink); border-bottom-color:var(--ink3)}
       if (e.unlock) {
         Object.keys(st.holders).forEach(function (k) { if (st.holders[k] === e.l) delete st.holders[k]; });
       }
-      if (e.k === 'err' && e.b.indexOf('deadlock') >= 0) st.killed++;
+      if (e.k === 'err' && e.b.toLowerCase().indexOf('deadlock') >= 0) st.killed++;
     });
     return st;
   }
@@ -1029,6 +1029,16 @@ footer a:hover{color:var(--ink); border-bottom-color:var(--ink3)}
   });
 
   /* ---------- scenario switching ---------- */
+  /* 글에서 특정 시나리오로 바로 들어올 수 있게 — 예: .../flashorder/#deadlock */
+  function scenarioFromHash() {
+    var h = (location.hash || '').replace(/^#/, '').toLowerCase();
+    if (!h) return 0;
+    for (var i = 0; i < SC.length; i++) {
+      if (SC[i].id.toLowerCase() === h || SC[i].no === h) return i;
+    }
+    return 0;
+  }
+
   function load(i, keepFix) {
     idx = i;
     if (!keepFix) { useFixed = false; fixBtn.setAttribute('aria-pressed', 'false'); fixBtn.textContent = '잠금 순서를 ID 오름차순으로'; }
@@ -1038,6 +1048,7 @@ footer a:hover{color:var(--ink); border-bottom-color:var(--ink3)}
     Array.prototype.forEach.call(picker.children, function (b, j) {
       b.setAttribute('aria-pressed', j === i ? 'true' : 'false');
     });
+    try { history.replaceState(null, '', '#' + SC[i].id); } catch (e) { /* file:// 등에서는 무시 */ }
   }
 
   picker.innerHTML = SC.map(function (sc, i) {
@@ -1057,8 +1068,13 @@ footer a:hover{color:var(--ink); border-bottom-color:var(--ink3)}
     rz = setTimeout(function () { layout(); paint(); }, 120);
   });
 
+  window.addEventListener('hashchange', function () {
+    var i = scenarioFromHash();
+    if (i !== idx) load(i);
+  });
+
   document.fonts && document.fonts.ready.then(function () { layout(); paint(); });
-  load(0);
+  load(scenarioFromHash());
 })();
 </script>
 
