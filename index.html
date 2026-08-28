@@ -1,0 +1,1066 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>재고 1개, 두 명 — FlashOrder 동시성 재현기</title>
+<meta name="description" content="재고 1개를 두 명이 동시에 사는 순간을 한 틱씩 재생하고, 비관적 락·낙관적 락·원자적 UPDATE·데드락까지 타임라인과 코드로 나란히 보는 재현기.">
+<meta name="author" content="DuckVeloper">
+<meta property="og:type" content="website">
+<meta property="og:title" content="재고 1개, 두 명 — FlashOrder 동시성 재현기">
+<meta property="og:description" content="PostgreSQL 17.11에서 실제로 재현한 Lost Update와 데드락을, 눌러서 한 틱씩 돌려 보는 페이지.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=swap">
+<style>
+  *{margin:0;padding:0}
+  img,svg{display:block;max-width:100%}
+  html{-webkit-text-size-adjust:100%}
+</style>
+</head>
+<body>
+<style>
+:root{
+  --ground:#eceff0; --paper:#f7f9f9; --sunk:#e2e7e7;
+  --ink:#0f1e1d; --ink2:#52625f; --ink3:#7b8a87;
+  --rule:#ccd7d5; --rule2:#dde5e4;
+  --a:#0d6f6b; --a-soft:#d6eae9; --a-line:#0d6f6b;
+  --b:#b04617; --b-soft:#f7e3d7; --b-line:#b04617;
+  --lock:#6a4fa3; --lock-soft:#e7e1f4;
+  --alarm:#bd1130; --alarm-soft:#f9dde1;
+  --ok:#1c6b45;
+  --shadow:0 1px 2px rgba(15,30,29,.06), 0 8px 24px -18px rgba(15,30,29,.35);
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --sans:"IBM Plex Sans KR","IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic",sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0b1211; --paper:#131d1c; --sunk:#0e1716;
+    --ink:#e2ecea; --ink2:#8ba09d; --ink3:#6b807d;
+    --rule:#273836; --rule2:#1d2b2a;
+    --a:#46d2cb; --a-soft:#123230; --a-line:#46d2cb;
+    --b:#ff9455; --b-soft:#33200f; --b-line:#ff9455;
+    --lock:#ab8df2; --lock-soft:#241d3a;
+    --alarm:#ff5f72; --alarm-soft:#391219;
+    --ok:#57c48b;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -20px rgba(0,0,0,.9);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0b1211; --paper:#131d1c; --sunk:#0e1716;
+  --ink:#e2ecea; --ink2:#8ba09d; --ink3:#6b807d;
+  --rule:#273836; --rule2:#1d2b2a;
+  --a:#46d2cb; --a-soft:#123230; --a-line:#46d2cb;
+  --b:#ff9455; --b-soft:#33200f; --b-line:#ff9455;
+  --lock:#ab8df2; --lock-soft:#241d3a;
+  --alarm:#ff5f72; --alarm-soft:#391219;
+  --ok:#57c48b;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -20px rgba(0,0,0,.9);
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:var(--sans); font-size:16px; line-height:1.68;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px; margin:0 auto; padding:clamp(28px,5vw,64px) clamp(16px,4vw,32px) 80px;}
+h1,h2,h3{text-wrap:balance; margin:0}
+:focus-visible{outline:2px solid var(--a); outline-offset:2px; border-radius:3px}
+
+/* ---------- header ---------- */
+.eyebrow{
+  font-family:var(--mono); font-size:11.5px; font-weight:500;
+  letter-spacing:.16em; text-transform:uppercase; color:var(--ink3);
+}
+h1{
+  font-size:clamp(34px,6.4vw,58px); font-weight:700; letter-spacing:-.035em;
+  line-height:1.06; margin:14px 0 0;
+}
+.lede{
+  margin:20px 0 0; max-width:62ch; font-size:clamp(15px,1.6vw,17px);
+  color:var(--ink2);
+}
+.lede b{color:var(--ink); font-weight:600}
+.rig{
+  display:flex; flex-wrap:wrap; gap:8px 18px; margin:26px 0 0;
+  padding-top:16px; border-top:1px solid var(--rule);
+  font-family:var(--mono); font-size:12px; color:var(--ink3);
+}
+.rig span b{color:var(--ink2); font-weight:500}
+
+/* ---------- scenario selector ---------- */
+.track{margin:44px 0 0}
+.track-head{
+  display:flex; align-items:baseline; justify-content:space-between; gap:16px;
+  margin-bottom:12px;
+}
+@media (max-width:620px){ .track-head .eyebrow+.eyebrow{display:none} }
+.picker{display:grid; grid-template-columns:repeat(5,1fr); gap:8px}
+@media (max-width:760px){ .picker{grid-template-columns:repeat(2,1fr)} }
+.pick{
+  appearance:none; text-align:left; cursor:pointer;
+  background:var(--paper); color:var(--ink);
+  border:1px solid var(--rule); border-radius:2px;
+  padding:11px 12px 12px; display:flex; flex-direction:column; gap:5px;
+  font-family:inherit; transition:border-color .15s, background .15s, transform .15s;
+}
+.pick:hover{border-color:var(--ink3)}
+.pick .no{
+  font-family:var(--mono); font-size:10.5px; letter-spacing:.14em;
+  color:var(--ink3); text-transform:uppercase;
+}
+.pick .nm{font-size:14px; font-weight:600; letter-spacing:-.01em; line-height:1.3}
+.pick .tag{font-family:var(--mono); font-size:11px; color:var(--ink3)}
+.pick[aria-pressed="true"]{
+  background:var(--ink); color:var(--ground); border-color:var(--ink);
+}
+.pick[aria-pressed="true"] .no,.pick[aria-pressed="true"] .tag{color:var(--ground); opacity:.62}
+.pick[data-bad="1"] .tag{color:var(--alarm)}
+.pick[aria-pressed="true"][data-bad="1"] .tag{color:var(--ground); opacity:.75}
+
+/* ---------- analyzer ---------- */
+.panel{
+  background:var(--paper); border:1px solid var(--rule); border-radius:3px;
+  box-shadow:var(--shadow); margin-top:14px;
+}
+.panel-bar{
+  display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+  padding:11px 14px; border-bottom:1px solid var(--rule2);
+}
+.panel-title{font-family:var(--mono); font-size:11.5px; letter-spacing:.13em; text-transform:uppercase; color:var(--ink3)}
+.legend{display:flex; gap:14px; margin-left:auto; flex-wrap:wrap}
+.lg{display:flex; align-items:center; gap:6px; font-family:var(--mono); font-size:11px; color:var(--ink2)}
+.lg i{width:14px; height:9px; border-radius:1px; display:block}
+.lg.w i{background:repeating-linear-gradient(-45deg,var(--lock) 0 2px,transparent 2px 5px); border:1px solid var(--lock)}
+.lg.e i{background:var(--alarm)}
+
+.scope{overflow-x:auto; overflow-y:hidden; scrollbar-width:thin}
+.stage{position:relative; padding:0 0 6px}
+.rulerrow{display:flex; border-bottom:1px solid var(--rule2)}
+.corner{
+  position:sticky; left:0; z-index:4; flex:0 0 var(--gut); height:22px;
+  background:var(--paper); border-right:1px solid var(--rule2);
+}
+.ruler{position:relative; flex:1 1 auto; height:22px}
+.tick{position:absolute; top:0; bottom:0; border-left:1px solid var(--rule2)}
+.tick s{
+  position:absolute; top:4px; left:5px; text-decoration:none;
+  font-family:var(--mono); font-size:10px; color:var(--ink3);
+}
+.lane{position:relative; height:56px; border-bottom:1px solid var(--rule2); display:flex}
+.lane:last-of-type{border-bottom:0}
+.lane-tag{
+  position:sticky; left:0; z-index:4; flex:0 0 var(--gut);
+  display:flex; flex-direction:column; justify-content:center; gap:1px;
+  padding-left:14px; border-right:1px solid var(--rule2); background:var(--paper);
+}
+.lane-tag .who{font-size:13px; font-weight:600; letter-spacing:-.01em}
+.lane-tag .pid{font-family:var(--mono); font-size:10.5px; color:var(--ink3)}
+.lane[data-lane="A"] .who{color:var(--a)}
+.lane[data-lane="B"] .who{color:var(--b)}
+.lane-body{position:relative; flex:1 1 auto}
+
+.ev{
+  position:absolute; top:12px; height:32px; border-radius:2px;
+  overflow:hidden; white-space:nowrap;
+  display:flex; align-items:center; padding:0 4px;
+  font-family:var(--mono); font-size:10px; letter-spacing:0;
+  border:1px solid transparent;
+}
+.lane[data-lane="A"] .ev[data-k="sql"]{background:var(--a-soft); border-color:var(--a-line); color:var(--a)}
+.lane[data-lane="B"] .ev[data-k="sql"]{background:var(--b-soft); border-color:var(--b-line); color:var(--b)}
+.lane[data-lane="A"] .ev[data-k="app"]{background:transparent; border-color:var(--a-line); border-style:dashed; color:var(--a); opacity:.85}
+.lane[data-lane="B"] .ev[data-k="app"]{background:transparent; border-color:var(--b-line); border-style:dashed; color:var(--b); opacity:.85}
+.ev[data-k="wait"]{
+  background:repeating-linear-gradient(-45deg,var(--lock-soft) 0 4px,transparent 4px 9px);
+  border-color:var(--lock); color:var(--lock);
+}
+.ev[data-k="err"]{background:var(--alarm); border-color:var(--alarm); color:#fff; font-weight:600}
+.ev[data-k="commit"]{font-weight:600}
+.ev.on{animation:pop .18s ease-out}
+@keyframes pop{from{transform:translateY(2px)}to{transform:none}}
+.hold{
+  position:absolute; bottom:5px; height:3px; border-radius:2px; background:var(--ink3); opacity:.5;
+}
+.hold[data-lane="A"]{background:var(--a)}
+.hold[data-lane="B"]{background:var(--b)}
+.head{
+  position:absolute; top:0; bottom:0; width:1px; background:var(--alarm);
+  z-index:4; pointer-events:none;
+}
+.head::before{
+  content:""; position:absolute; top:-1px; left:-3px;
+  border-left:3.5px solid transparent; border-right:3.5px solid transparent;
+  border-top:6px solid var(--alarm);
+}
+@media (prefers-reduced-motion:reduce){ .ev.on{animation:none} }
+</style>
+<style>
+/* ---------- transport ---------- */
+.transport{
+  display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  padding:11px 14px; border-top:1px solid var(--rule2);
+}
+.btn{
+  appearance:none; cursor:pointer; font-family:var(--mono); font-size:12px; font-weight:500;
+  letter-spacing:.03em; color:var(--ink); background:var(--ground);
+  border:1px solid var(--rule); border-radius:2px; padding:7px 13px;
+  transition:background .14s,border-color .14s,color .14s;
+}
+.btn:hover{border-color:var(--ink3)}
+.btn.primary{background:var(--ink); color:var(--ground); border-color:var(--ink); min-width:96px}
+.btn.primary:hover{opacity:.88}
+.btn[disabled]{opacity:.4; cursor:not-allowed}
+.speeds{display:flex; margin-left:auto; border:1px solid var(--rule); border-radius:2px; overflow:hidden}
+.speeds .btn{border:0; border-radius:0; padding:7px 10px; background:transparent}
+.speeds .btn[aria-pressed="true"]{background:var(--sunk); color:var(--ink)}
+
+/* ---------- readout ---------- */
+.readout{display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:14px}
+@media (max-width:760px){ .readout{grid-template-columns:1fr} }
+.rowcard{background:var(--paper); border:1px solid var(--rule); border-radius:3px; padding:13px 14px; box-shadow:var(--shadow)}
+.rowcard h3{
+  font-family:var(--mono); font-size:11px; letter-spacing:.13em; text-transform:uppercase;
+  color:var(--ink3); font-weight:500; margin-bottom:10px;
+}
+.fields{display:flex; flex-wrap:wrap; gap:6px 22px}
+.f{display:flex; flex-direction:column; gap:1px}
+.f .k{font-family:var(--mono); font-size:10.5px; color:var(--ink3)}
+.f .v{
+  font-family:var(--mono); font-size:23px; font-weight:600; line-height:1.15;
+  font-variant-numeric:tabular-nums; letter-spacing:-.02em;
+}
+.f .v.flash{animation:flash .5s ease-out}
+@keyframes flash{0%{color:var(--alarm)}100%{color:inherit}}
+.f .v.bad{color:var(--alarm)}
+.holder{
+  display:inline-flex; align-items:center; gap:5px; margin-top:8px;
+  font-family:var(--mono); font-size:11px; padding:2px 7px; border-radius:2px;
+  border:1px solid var(--rule);
+}
+.holder[data-lane="A"]{color:var(--a); border-color:var(--a); background:var(--a-soft)}
+.holder[data-lane="B"]{color:var(--b); border-color:var(--b); background:var(--b-soft)}
+.holder.none{color:var(--ink3)}
+
+.verdict{
+  grid-column:1/-1; display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+  border-left:3px solid var(--rule); padding:13px 16px;
+  background:var(--paper); border:1px solid var(--rule); border-left-width:3px; border-radius:3px;
+  box-shadow:var(--shadow);
+}
+.verdict[data-v="bad"]{border-left-color:var(--alarm); background:var(--alarm-soft)}
+.verdict[data-v="ok"]{border-left-color:var(--ok)}
+.verdict[data-v="idle"]{opacity:.6}
+.verdict .vl{font-family:var(--mono); font-size:11px; letter-spacing:.13em; text-transform:uppercase; color:var(--ink3)}
+.verdict .vt{font-size:15px; font-weight:600; letter-spacing:-.01em}
+.verdict[data-v="bad"] .vt{color:var(--alarm)}
+.verdict[data-v="ok"] .vt{color:var(--ok)}
+.verdict .vm{margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--ink2); display:flex; gap:16px; flex-wrap:wrap}
+
+/* ---------- code + tape ---------- */
+.split{display:grid; grid-template-columns:1.32fr 1fr; gap:10px; margin-top:10px; align-items:start}
+.split>*,.readout>*{min-width:0}
+@media (max-width:860px){ .split{grid-template-columns:1fr} }
+pre.code{
+  margin:0; overflow-x:auto; font-family:var(--mono); font-size:12.5px; line-height:1.72;
+  padding:12px 0 14px; tab-size:4;
+}
+.cl{display:flex; gap:0; padding:0 14px 0 0; border-left:3px solid transparent; transition:background .12s}
+.cl .ln{
+  flex:0 0 40px; text-align:right; padding-right:12px; color:var(--ink3); opacity:.55;
+  user-select:none; font-variant-numeric:tabular-nums;
+}
+.cl .src{white-space:pre; color:var(--ink)}
+.cl.act-a{background:var(--a-soft); border-left-color:var(--a)}
+.cl.act-b{background:var(--b-soft); border-left-color:var(--b)}
+.cl.act-ab{background:linear-gradient(90deg,var(--a-soft),var(--b-soft)); border-left-color:var(--lock)}
+.cl .mk{
+  flex:0 0 18px; font-size:10.5px; font-weight:600; text-align:center; opacity:0;
+}
+.cl.act-a .mk{opacity:1; color:var(--a)} .cl.act-b .mk{opacity:1; color:var(--b)}
+.cl.act-ab .mk{opacity:1; color:var(--lock)}
+.k{color:var(--lock)} .an{color:var(--b)} .cm{color:var(--ink3); font-style:italic} .st{color:var(--ok)} .nu{color:var(--a)}
+
+.tape{
+  font-family:var(--mono); font-size:11.5px; line-height:1.62;
+  padding:12px 14px; max-height:330px; overflow-y:auto; overflow-x:hidden;
+}
+.tl{display:flex; gap:8px; padding:1.5px 0; border-bottom:1px dotted var(--rule2)}
+.tl:last-child{border-bottom:0}
+.tl .t{flex:0 0 46px; color:var(--ink3); font-variant-numeric:tabular-nums}
+.tl .w{flex:0 0 16px; font-weight:600}
+.tl[data-lane="A"] .w{color:var(--a)} .tl[data-lane="B"] .w{color:var(--b)}
+.tl .m{color:var(--ink2); word-break:break-word; white-space:normal}
+.tl[data-k="err"] .m{color:var(--alarm); font-weight:500}
+.tl[data-k="wait"] .m{color:var(--lock)}
+.tape .empty{color:var(--ink3)}
+
+/* ---------- prose + table ---------- */
+section.prose{margin-top:64px}
+section.prose h2{
+  font-size:clamp(21px,2.8vw,27px); font-weight:700; letter-spacing:-.028em; line-height:1.25;
+  padding-top:20px; border-top:1px solid var(--rule);
+}
+section.prose p{margin:14px 0 0; max-width:66ch; color:var(--ink2)}
+section.prose p b{color:var(--ink); font-weight:600}
+.tblwrap{overflow-x:auto; margin-top:22px; border:1px solid var(--rule); border-radius:3px; background:var(--paper); box-shadow:var(--shadow)}
+table{border-collapse:collapse; width:100%; min-width:620px; font-size:13.5px}
+th,td{padding:11px 14px; text-align:left; border-bottom:1px solid var(--rule2); vertical-align:top}
+thead th{
+  font-family:var(--mono); font-size:10.5px; letter-spacing:.12em; text-transform:uppercase;
+  color:var(--ink3); font-weight:500; background:var(--sunk);
+}
+tbody tr:last-child td{border-bottom:0}
+td.nm{font-weight:600; color:var(--ink); white-space:nowrap}
+td.mono{font-family:var(--mono); font-size:12.5px; font-variant-numeric:tabular-nums}
+.bad{color:var(--alarm); font-weight:600} .good{color:var(--ok); font-weight:600}
+
+.logbox{
+  margin-top:22px; background:var(--sunk); border:1px solid var(--rule); border-radius:3px;
+  padding:14px 16px; overflow-x:auto;
+}
+.logbox pre{margin:0; font-family:var(--mono); font-size:12px; line-height:1.72; color:var(--ink2); white-space:pre}
+.logbox .hl{color:var(--alarm); font-weight:600}
+.logcap{font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--ink3); margin-bottom:9px}
+
+footer{
+  margin-top:72px; padding-top:22px; border-top:1px solid var(--rule);
+  display:flex; gap:18px; flex-wrap:wrap; align-items:baseline;
+  font-family:var(--mono); font-size:12px; color:var(--ink3);
+}
+footer a{color:var(--ink2); text-decoration:none; border-bottom:1px solid var(--rule)}
+footer a:hover{color:var(--ink); border-bottom-color:var(--ink3)}
+</style>
+
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">FlashOrder · 재고 동시성 재현기</div>
+    <h1>재고 1개, 두 명</h1>
+    <p class="lede">
+      한정판 상품의 재고가 <b>1개</b> 남았습니다. 같은 순간 두 사람이 구매 버튼을 눌렀습니다.
+      <code style="font-family:var(--mono);font-size:.92em">@Transactional</code>은 붙어 있습니다.
+      그런데 <b>두 명 다 결제에 성공합니다.</b> 아래에서 그 순간을 한 틱씩 재생해 보고,
+      해법 세 가지를 차례로 걸어 무엇이 어떻게 풀리는지 확인해 보세요.
+    </p>
+    <div class="rig">
+      <span><b>PostgreSQL 17.11</b></span>
+      <span>격리 수준 <b>READ COMMITTED</b>(기본값)</span>
+      <span>Spring Boot 3 · JPA</span>
+      <span>1틱 = 실제 수 ms</span>
+    </div>
+  </header>
+
+  <div class="track">
+    <div class="track-head">
+      <div class="eyebrow">시나리오 선택</div>
+      <div class="eyebrow" style="color:var(--ink2)">01은 문제, 02~04는 해법, 05는 해법이 데려온 새 문제</div>
+    </div>
+    <div class="picker" id="picker" role="group" aria-label="시나리오 선택"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-bar">
+      <span class="panel-title" id="scName">락 없음</span>
+      <div class="legend">
+        <span class="lg"><i style="background:var(--a-soft);border:1px solid var(--a)"></i>SQL 실행</span>
+        <span class="lg w"><i></i>잠금 대기</span>
+        <span class="lg e"><i></i>예외</span>
+      </div>
+    </div>
+
+    <div class="scope" id="scope">
+      <div class="stage" id="stage" style="--gut:104px">
+        <div class="rulerrow"><div class="corner"></div><div class="ruler" id="ruler"></div></div>
+        <div class="lane" data-lane="A">
+          <div class="lane-tag"><span class="who">사용자 A</span><span class="pid">tx 800</span></div>
+          <div class="lane-body" id="laneA"></div>
+        </div>
+        <div class="lane" data-lane="B">
+          <div class="lane-tag"><span class="who">사용자 B</span><span class="pid">tx 801</span></div>
+          <div class="lane-body" id="laneB"></div>
+        </div>
+        <div class="head" id="head" style="left:104px"></div>
+      </div>
+    </div>
+
+    <div class="transport">
+      <button class="btn primary" id="play">▶ 재생</button>
+      <button class="btn" id="step">한 스텝 →</button>
+      <button class="btn" id="reset">↺ 처음으로</button>
+      <span id="fixWrap" style="display:none">
+        <button class="btn" id="fix" aria-pressed="false">잠금 순서를 ID 오름차순으로</button>
+      </span>
+      <div class="speeds" role="group" aria-label="재생 속도">
+        <button class="btn spd" data-s="0.5" aria-pressed="false">0.5×</button>
+        <button class="btn spd" data-s="1" aria-pressed="true">1×</button>
+        <button class="btn spd" data-s="2" aria-pressed="false">2×</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="readout">
+    <div class="rowcard">
+      <h3>DB에 실제로 남는 값</h3>
+      <div id="rows"></div>
+    </div>
+    <div class="rowcard">
+      <h3>커밋된 주문</h3>
+      <div class="fields">
+        <div class="f"><span class="k">orders 행 수</span><span class="v" id="ordN">0</span></div>
+        <div class="f"><span class="k" id="lab2">팔린 수량</span><span class="v" id="soldN">0</span></div>
+        <div class="f"><span class="k" id="lab3">초과 판매</span><span class="v" id="overN">0</span></div>
+      </div>
+    </div>
+    <div class="verdict" id="verdict" data-v="idle">
+      <span class="vl">판정</span>
+      <span class="vt" id="vtext">재생 버튼을 누르세요</span>
+      <span class="vm" id="vmetrics"></span>
+    </div>
+  </div>
+
+  <div class="split">
+    <div class="panel" style="margin-top:0">
+      <div class="panel-bar"><span class="panel-title">이 타임라인을 만드는 코드</span></div>
+      <pre class="code" id="code"></pre>
+    </div>
+    <div class="panel" style="margin-top:0">
+      <div class="panel-bar"><span class="panel-title">세션 로그</span></div>
+      <div class="tape" id="tape"><div class="empty">아직 실행된 문장이 없습니다.</div></div>
+    </div>
+  </div>
+
+  <section class="prose">
+    <h2>네 가지 방법은 같은 결과를 서로 다른 비용으로 산다</h2>
+    <p>
+      초과 판매를 막는 방법은 하나가 아닙니다. 중요한 건 <b>무엇을 막았는가</b>가 아니라
+      <b>대신 무엇을 지불했는가</b>입니다. 위 시나리오를 다 돌려본 뒤 이 표를 보면
+      숫자가 어디서 나온 것인지 보일 겁니다.
+    </p>
+    <div class="tblwrap">
+      <table>
+        <thead>
+          <tr><th>방법</th><th>초과 판매</th><th>B가 기다린 시간</th><th>재시도</th><th>행 잠금 보유</th><th>어디에 맞나</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="nm">락 없음</td>
+            <td class="mono bad">1건 발생</td><td class="mono">300틱(암묵적)</td><td class="mono">0</td><td class="mono">620~1120틱</td>
+            <td>없음. <code>@Transactional</code>만으로는 못 막습니다</td>
+          </tr>
+          <tr>
+            <td class="nm">비관적 락</td>
+            <td class="mono good">0</td><td class="mono">500틱</td><td class="mono">0</td><td class="mono">150~780틱</td>
+            <td>충돌이 잦고 재시도 비용이 큰 선착순 판매</td>
+          </tr>
+          <tr>
+            <td class="nm">낙관적 락</td>
+            <td class="mono good">0</td><td class="mono">190틱</td><td class="mono bad">1회</td><td class="mono">500~900틱</td>
+            <td>충돌이 드문 일반 수정. 잦으면 재시도가 비용</td>
+          </tr>
+          <tr>
+            <td class="nm">원자적 UPDATE</td>
+            <td class="mono good">0</td><td class="mono">300틱</td><td class="mono">0</td><td class="mono good">150~570틱(최단)</td>
+            <td>재고 차감처럼 <b>읽고-고쳐-쓰기</b>가 한 문장으로 되는 경우</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      틱 수치는 위 타임라인에 정의된 가상 시간입니다. 절대값이 아니라 <b>서로 간의 비율</b>을 보세요.
+      비관적 락은 B를 가장 오래 세워 두고, 낙관적 락은 대기를 줄이는 대신 트랜잭션 하나를 통째로 버리며,
+      원자적 UPDATE는 애초에 애플리케이션으로 값을 들고 나오지 않아 잠금 구간이 가장 짧습니다.
+    </p>
+
+    <h2>데드락은 지어낸 게 아니라 실제로 찍힌 로그입니다</h2>
+    <p>
+      시나리오 05는 위 재현기와 같은 순서로 실제 PostgreSQL 17.11에 두 세션을 붙여 만든 것입니다.
+      아래는 그때 서버 로그에 그대로 남은 내용입니다. 두 프로세스가 서로의 트랜잭션을 기다리고 있고,
+      PostgreSQL이 <code>deadlock_timeout</code> 1초 뒤에 한쪽을 강제로 끊었습니다.
+    </p>
+    <div class="logbox">
+      <div class="logcap">postgresql.log</div>
+      <pre>2026-08-28 06:59:00.370 UTC [120] <span class="hl">ERROR:  deadlock detected</span>
+2026-08-28 06:59:00.370 UTC [120] DETAIL:  Process 120 waits for ShareLock on transaction 801; blocked by process 127.
+	Process 127 waits for ShareLock on transaction 800; blocked by process 120.
+	Process 120: SELECT id, stock FROM product WHERE id = 2 FOR UPDATE;
+	Process 127: SELECT id, stock FROM product WHERE id = 1 FOR UPDATE;
+2026-08-28 06:59:00.370 UTC [120] HINT:  See server log for query details.
+2026-08-28 06:59:00.370 UTC [120] CONTEXT:  while locking tuple (0,2) in relation "product"</pre>
+    </div>
+    <p>
+      로그에서 읽어야 할 건 <b>마지막 두 줄</b>입니다. 각 프로세스가 어떤 문장에서 멈췄는지 그대로 나옵니다.
+      한쪽은 2번을, 다른 쪽은 1번을 잡으려다 물렸습니다. 잠그는 <b>순서</b>만 통일하면 사라지는 문제라는 뜻입니다.
+      시나리오 05에서 <b>잠금 순서를 ID 오름차순으로</b> 버튼을 눌러 같은 타임라인을 다시 돌려 보세요.
+    </p>
+  </section>
+
+  <footer>
+    <span>FlashOrder — 시니어 백엔드 시리즈 부록</span>
+    <a href="https://seungwon08.tistory.com" target="_blank" rel="noopener">seungwon08.tistory.com</a>
+    <span style="margin-left:auto">PostgreSQL 17.11 · 2026-08-28 측정</span>
+  </footer>
+</div>
+
+<script>
+  var P1 = 'product #1 · 한정판 후드';
+  var P2 = 'product #2 · 한정판 캡';
+
+  function rows1(stock, ver) { return [{ id: 'p1', label: P1, stock: stock, version: ver }]; }
+
+  var SC = [
+    /* ---------------------------------------------------------------- 01 */
+    {
+      id: 'lost', no: '01', nm: '락 없음', tag: '초과 판매 발생', bad: true,
+      title: '락 없음 — 두 트랜잭션이 같은 값을 읽는다',
+      T: 1290, initStock: 1, hasVersion: false,
+      init: { rows: rows1(1, null), orders: 0 },
+      code: [
+        '@Transactional',
+        'public void order(Long productId, Long memberId) {',
+        '',
+        '    Product product = productRepository.findById(productId)',
+        '            .orElseThrow(SoldOutException::new);',
+        '',
+        '    product.decrease();      // stock 1 -> 0, 아직 메모리 위의 값',
+        '',
+        '    orderRepository.save(Order.of(memberId, productId));',
+        '}   // flush -> INSERT orders -> UPDATE product -> COMMIT'
+      ],
+      ev: [
+        { l: 'A', t0: 0, t1: 60, k: 'sql', b: 'BEGIN', ln: 2, g: 'BEGIN' },
+        { l: 'B', t0: 70, t1: 130, k: 'sql', b: 'BEGIN', ln: 2, g: 'BEGIN' },
+        { l: 'A', t0: 150, t1: 250, k: 'sql', b: 'SELECT', ln: 4, g: 'SELECT * FROM product WHERE id = 1  ->  stock = 1' },
+        { l: 'B', t0: 260, t1: 360, k: 'sql', b: 'SELECT', ln: 4, g: 'SELECT * FROM product WHERE id = 1  ->  stock = 1  (A와 같은 값을 읽었다)' },
+        { l: 'A', t0: 380, t1: 470, k: 'app', b: 'decrease', ln: 7, g: '메모리에서 1 -> 0. 아직 SQL은 한 줄도 나가지 않았다' },
+        { l: 'B', t0: 480, t1: 570, k: 'app', b: 'decrease', ln: 7, g: '메모리에서 1 -> 0' },
+        { l: 'A', t0: 520, t1: 600, k: 'sql', b: 'INSERT', ln: 9, g: 'INSERT INTO orders ...', set: { orders: 1 } },
+        { l: 'A', t0: 620, t1: 700, k: 'sql', b: 'UPDATE', ln: 10, g: 'UPDATE product SET stock = 0 WHERE id = 1  ->  행 잠금 획득', lock: 'p1', set: { stock: 0 } },
+        { l: 'B', t0: 720, t1: 800, k: 'sql', b: 'INSERT', ln: 9, g: 'INSERT INTO orders ...', set: { orders: 2 } },
+        { l: 'B', t0: 820, t1: 980, k: 'wait', b: '행 잠금 대기', ln: 10, g: 'UPDATE 가 A의 행 잠금에 막혀 멈춘다. 락을 안 걸어도 쓰기끼리는 줄을 선다' },
+        { l: 'A', t0: 900, t1: 980, k: 'commit', b: 'COMMIT', ln: 10, g: 'COMMIT — 잠금 해제', unlock: true },
+        { l: 'B', t0: 980, t1: 1050, k: 'sql', b: 'UPDATE', ln: 10, g: '잠금이 풀리자 자기가 들고 있던 0 을 그대로 덮어쓴다  <-  여기서 A의 차감이 사라진다', lock: 'p1', set: { stock: 0 } },
+        { l: 'B', t0: 1100, t1: 1180, k: 'commit', b: 'COMMIT', ln: 10, g: 'COMMIT — 두 명 다 주문 성공', unlock: true }
+      ],
+      verdict: { v: 'bad', t: '두 명 다 주문에 성공했습니다 — 재고는 1개였습니다' },
+      metrics: ['B 대기 160틱', 'UPDATE 2회, 차감은 1회']
+    },
+
+    /* ---------------------------------------------------------------- 02 */
+    {
+      id: 'pess', no: '02', nm: '비관적 락', tag: 'FOR UPDATE', bad: false,
+      title: '비관적 락 — 읽는 순간부터 줄을 세운다',
+      T: 1120, initStock: 1, hasVersion: false,
+      init: { rows: rows1(1, null), orders: 0 },
+      code: [
+        'public interface ProductRepository extends JpaRepository<Product, Long> {',
+        '',
+        '    @Lock(LockModeType.PESSIMISTIC_WRITE)',
+        '    @Query("select p from Product p where p.id = :id")',
+        '    Optional<Product> findByIdForUpdate(@Param("id") Long id);',
+        '}',
+        '',
+        '@Transactional',
+        'public void order(Long productId, Long memberId) {',
+        '    Product product = productRepository.findByIdForUpdate(productId)',
+        '            .orElseThrow(SoldOutException::new);',
+        '',
+        '    product.decrease();      // 재고가 0이면 여기서 SoldOutException',
+        '    orderRepository.save(Order.of(memberId, productId));',
+        '}'
+      ],
+      ev: [
+        { l: 'A', t0: 0, t1: 60, k: 'sql', b: 'BEGIN', ln: 8, g: 'BEGIN' },
+        { l: 'B', t0: 70, t1: 130, k: 'sql', b: 'BEGIN', ln: 8, g: 'BEGIN' },
+        { l: 'A', t0: 150, t1: 260, k: 'sql', b: 'FOR UPDATE', ln: 10, g: 'SELECT ... WHERE id = 1 FOR UPDATE  ->  stock = 1 · 행 잠금 획득', lock: 'p1' },
+        { l: 'B', t0: 280, t1: 720, k: 'wait', b: 'FOR UPDATE 잠금 대기', ln: 10, g: '읽기 자체가 막힌다. A가 커밋할 때까지 값을 볼 수 없다' },
+        { l: 'A', t0: 300, t1: 390, k: 'app', b: 'decrease', ln: 13, g: '1 -> 0' },
+        { l: 'A', t0: 400, t1: 480, k: 'sql', b: 'INSERT', ln: 14, g: 'INSERT INTO orders ...', set: { orders: 1 } },
+        { l: 'A', t0: 500, t1: 580, k: 'sql', b: 'UPDATE', ln: 15, g: 'UPDATE product SET stock = 0 WHERE id = 1', set: { stock: 0 } },
+        { l: 'A', t0: 640, t1: 720, k: 'commit', b: 'COMMIT', ln: 15, g: 'COMMIT — 잠금 해제', unlock: true },
+        { l: 'B', t0: 720, t1: 810, k: 'sql', b: 'FOR UPDATE', ln: 10, g: '이제야 읽는다  ->  stock = 0 (A가 커밋한 최신 값)', lock: 'p1' },
+        { l: 'B', t0: 830, t1: 910, k: 'err', b: '품절 예외', ln: 13, g: '재고 0 -> SoldOutException' },
+        { l: 'B', t0: 940, t1: 1040, k: 'sql', b: 'ROLLBACK', ln: 15, g: 'ROLLBACK — 주문 생성 안 됨', unlock: true }
+      ],
+      verdict: { v: 'ok', t: '한 명만 주문에 성공했습니다 — 대신 B는 끝까지 기다렸습니다' },
+      metrics: ['B 대기 440틱', '잠금 보유 150~720틱']
+    },
+
+    /* ---------------------------------------------------------------- 03 */
+    {
+      id: 'opt', no: '03', nm: '낙관적 락', tag: '@Version', bad: false,
+      title: '낙관적 락 — 막지 않고, 늦은 쪽을 되돌린다',
+      T: 1750, initStock: 1, hasVersion: true,
+      init: { rows: rows1(1, 0), orders: 0 },
+      code: [
+        '@Entity',
+        'public class Product {',
+        '    @Id private Long id;',
+        '    private int stock;',
+        '',
+        '    @Version',
+        '    private Long version;        // 0 -> 1 -> 2 ...',
+        '}',
+        '',
+        '@Retryable(retryFor = OptimisticLockingFailureException.class, maxAttempts = 3)',
+        '@Transactional',
+        'public void order(Long productId, Long memberId) {',
+        '    Product product = productRepository.findById(productId).orElseThrow();',
+        '    product.decrease();',
+        '    orderRepository.save(Order.of(memberId, productId));',
+        '}   // UPDATE product SET stock=?, version=? WHERE id=? AND version=?'
+      ],
+      ev: [
+        { l: 'A', t0: 0, t1: 100, k: 'sql', b: 'BEGIN', ln: 11, g: 'BEGIN' },
+        { l: 'B', t0: 70, t1: 170, k: 'sql', b: 'BEGIN', ln: 11, g: 'BEGIN' },
+        { l: 'A', t0: 150, t1: 250, k: 'sql', b: 'SELECT', ln: 13, g: 'SELECT ...  ->  stock = 1, version = 0' },
+        { l: 'B', t0: 260, t1: 360, k: 'sql', b: 'SELECT', ln: 13, g: 'SELECT ...  ->  stock = 1, version = 0  (같은 버전을 들고 나갔다)' },
+        { l: 'A', t0: 400, t1: 480, k: 'sql', b: 'INSERT', ln: 15, g: 'INSERT INTO orders ...', set: { orders: 1 } },
+        { l: 'A', t0: 500, t1: 590, k: 'sql', b: 'UPDATE', ln: 16, g: 'UPDATE ... SET stock=0, version=1 WHERE id=1 AND version=0  ->  1 row', lock: 'p1', set: { stock: 0, version: 1 } },
+        { l: 'B', t0: 610, t1: 690, k: 'sql', b: 'INSERT', ln: 15, g: 'INSERT INTO orders ...  (이 행은 곧 롤백된다)', set: { orders: 2 } },
+        { l: 'B', t0: 710, t1: 900, k: 'wait', b: '행 잠금 대기', ln: 16, g: 'UPDATE 가 A의 행 잠금에 막혀 대기' },
+        { l: 'A', t0: 820, t1: 900, k: 'commit', b: 'COMMIT', ln: 16, g: 'COMMIT — version 이 1 이 되었다', unlock: true },
+        { l: 'B', t0: 900, t1: 980, k: 'sql', b: '0 rows', ln: 16, g: 'WHERE version = 0 이 더 이상 맞지 않는다  ->  0 rows' },
+        { l: 'B', t0: 1000, t1: 1090, k: 'err', b: '버전 충돌', ln: 16, g: '갱신된 행이 0개 -> OptimisticLockingFailureException' },
+        { l: 'B', t0: 1110, t1: 1210, k: 'sql', b: 'ROLLBACK', ln: 16, g: 'ROLLBACK — 방금 넣은 주문도 같이 사라진다', set: { orders: 1 } },
+        { l: 'B', t0: 1250, t1: 1340, k: 'sql', b: '재시도', ln: 10, g: '@Retryable 이 두 번째 시도를 연다' },
+        { l: 'B', t0: 1360, t1: 1460, k: 'sql', b: 'SELECT', ln: 13, g: 'SELECT ...  ->  stock = 0, version = 1' },
+        { l: 'B', t0: 1480, t1: 1570, k: 'err', b: '품절 예외', ln: 14, g: '이번엔 재고가 없어서 실패한다. 정상적인 품절 처리' },
+        { l: 'B', t0: 1590, t1: 1680, k: 'sql', b: 'ROLLBACK', ln: 16, g: 'ROLLBACK', unlock: true }
+      ],
+      verdict: { v: 'ok', t: '한 명만 주문에 성공했습니다 — 대신 B의 트랜잭션 하나를 통째로 버렸습니다' },
+      metrics: ['B 대기 190틱', '재시도 1회', '버려진 INSERT 1건']
+    },
+
+    /* ---------------------------------------------------------------- 04 */
+    {
+      id: 'atomic', no: '04', nm: '원자적 UPDATE', tag: 'stock = stock - 1', bad: false,
+      title: '원자적 UPDATE — 값을 애플리케이션으로 들고 나오지 않는다',
+      T: 940, initStock: 1, hasVersion: false,
+      init: { rows: rows1(1, null), orders: 0 },
+      code: [
+        '@Modifying',
+        '@Query("""',
+        '    update Product p',
+        '       set p.stock = p.stock - 1',
+        '     where p.id = :id',
+        '       and p.stock > 0',
+        '    """)',
+        'int decreaseStock(@Param("id") Long id);',
+        '',
+        '@Transactional',
+        'public void order(Long productId, Long memberId) {',
+        '    if (productRepository.decreaseStock(productId) == 0) {',
+        '        throw new SoldOutException();',
+        '    }',
+        '    orderRepository.save(Order.of(memberId, productId));',
+        '}'
+      ],
+      ev: [
+        { l: 'A', t0: 0, t1: 60, k: 'sql', b: 'BEGIN', ln: 10, g: 'BEGIN' },
+        { l: 'B', t0: 70, t1: 130, k: 'sql', b: 'BEGIN', ln: 10, g: 'BEGIN' },
+        { l: 'A', t0: 150, t1: 250, k: 'sql', b: '1 row', ln: 12, g: 'UPDATE product SET stock = stock - 1 WHERE id = 1 AND stock > 0  ->  1 row', lock: 'p1', set: { stock: 0 } },
+        { l: 'B', t0: 270, t1: 570, k: 'wait', b: '행 잠금 대기', ln: 12, g: '같은 행이라 대기. 읽고-고쳐-쓰기 사이에 틈이 없다' },
+        { l: 'A', t0: 300, t1: 380, k: 'sql', b: 'INSERT', ln: 15, g: 'INSERT INTO orders ...', set: { orders: 1 } },
+        { l: 'A', t0: 490, t1: 570, k: 'commit', b: 'COMMIT', ln: 16, g: 'COMMIT — 잠금 해제', unlock: true },
+        { l: 'B', t0: 570, t1: 650, k: 'sql', b: '0 rows', ln: 12, g: '잠금이 풀린 뒤 stock > 0 을 다시 평가한다  ->  조건 불일치 -> 0 rows' },
+        { l: 'B', t0: 670, t1: 750, k: 'err', b: '품절 예외', ln: 13, g: '갱신 행 수가 0 이면 품절. 재고를 읽어본 적조차 없다' },
+        { l: 'B', t0: 780, t1: 880, k: 'sql', b: 'ROLLBACK', ln: 16, g: 'ROLLBACK' }
+      ],
+      verdict: { v: 'ok', t: '한 명만 주문에 성공했습니다 — 잠금 구간이 가장 짧습니다' },
+      metrics: ['B 대기 300틱', '잠금 보유 150~570틱', '왕복 1회']
+    },
+
+    /* ---------------------------------------------------------------- 05 */
+    {
+      id: 'deadlock', no: '05', nm: '데드락', tag: '잠금 순서', bad: true, deadlock: true,
+      title: '데드락 — 락을 제대로 걸어도 순서가 엇갈리면 물린다',
+      T: 2030, initStock: null, hasVersion: false,
+      init: { rows: [{ id: 'p1', label: P1, stock: 5, version: null }, { id: 'p2', label: P2, stock: 5, version: null }], orders: 0 },
+      code: [
+        '@Transactional',
+        'public void orderBundle(List<Long> productIds, Long memberId) {',
+        '',
+        '    // 요청에 담겨 온 순서 그대로 잠근다',
+        '    for (Long id : productIds) {',
+        '        Product p = productRepository.findByIdForUpdate(id);',
+        '        p.decrease();',
+        '    }',
+        '    orderRepository.save(Order.of(memberId, productIds));',
+        '}'
+      ],
+      ev: [
+        { l: 'A', t0: 0, t1: 100, k: 'sql', b: 'BEGIN', ln: 1, g: 'BEGIN — 장바구니 [1, 2]' },
+        { l: 'B', t0: 55, t1: 155, k: 'sql', b: 'BEGIN', ln: 1, g: 'BEGIN — 장바구니 [2, 1]' },
+        { l: 'A', t0: 150, t1: 250, k: 'sql', b: '#1 잠금', ln: 6, g: 'SELECT id, stock FROM product WHERE id = 1 FOR UPDATE  ->  획득', lock: 'p1' },
+        { l: 'B', t0: 200, t1: 300, k: 'sql', b: '#2 잠금', ln: 6, g: 'SELECT id, stock FROM product WHERE id = 2 FOR UPDATE  ->  획득', lock: 'p2' },
+        { l: 'A', t0: 330, t1: 1340, k: 'wait', b: '#2 대기 — B가 쥐고 있다', ln: 6, g: 'WHERE id = 2 FOR UPDATE  ->  B의 잠금에 막힘' },
+        { l: 'B', t0: 380, t1: 1570, k: 'wait', b: '#1 대기 — A가 쥐고 있다', ln: 6, g: 'WHERE id = 1 FOR UPDATE  ->  A의 잠금에 막힘. 이제 서로를 기다린다' },
+        { l: 'A', t0: 1340, t1: 1460, k: 'err', b: 'DEADLOCK', ln: 6, g: 'deadlock_timeout(기본 1초) 경과 -> PostgreSQL이 순환 대기를 감지하고 A를 강제 종료' },
+        { l: 'A', t0: 1460, t1: 1570, k: 'sql', b: 'ROLLBACK', ln: 10, g: 'ROLLBACK — A의 작업은 전부 사라진다', unlock: true },
+        { l: 'B', t0: 1570, t1: 1680, k: 'sql', b: '#1 잠금', ln: 6, g: 'A가 죽은 덕분에 이제 획득', lock: 'p1' },
+        { l: 'B', t0: 1700, t1: 1810, k: 'app', b: 'decrease', ln: 7, g: '5 -> 4 두 상품 모두 차감', set: { stock: 4, stock2: 4 } },
+        { l: 'B', t0: 1840, t1: 1930, k: 'commit', b: 'COMMIT', ln: 10, g: 'COMMIT — B만 살아남았다', set: { orders: 1 }, unlock: true }
+      ],
+      verdict: { v: 'bad', t: '트랜잭션 하나가 강제 종료됐습니다 — deadlock detected' },
+      metrics: ['감지까지 1초(deadlock_timeout)', 'A 작업 전량 폐기'],
+      fixed: {
+        title: '데드락 — 잠그는 순서를 통일하면 순환이 생기지 않는다',
+        T: 1240,
+        code: [
+          '@Transactional',
+          'public void orderBundle(List<Long> productIds, Long memberId) {',
+          '',
+          '    // 항상 ID 오름차순으로 잠근다 — 순환 대기가 만들어질 수 없다',
+          '    for (Long id : productIds.stream().sorted().toList()) {',
+          '        Product p = productRepository.findByIdForUpdate(id);',
+          '        p.decrease();',
+          '    }',
+          '    orderRepository.save(Order.of(memberId, productIds));',
+          '}'
+        ],
+        ev: [
+          { l: 'A', t0: 0, t1: 100, k: 'sql', b: 'BEGIN', ln: 1, g: 'BEGIN — 장바구니 [1, 2] -> 정렬 [1, 2]' },
+          { l: 'B', t0: 55, t1: 155, k: 'sql', b: 'BEGIN', ln: 1, g: 'BEGIN — 장바구니 [2, 1] -> 정렬 [1, 2]' },
+          { l: 'A', t0: 150, t1: 250, k: 'sql', b: '#1 잠금', ln: 6, g: 'WHERE id = 1 FOR UPDATE  ->  획득', lock: 'p1' },
+          { l: 'B', t0: 200, t1: 700, k: 'wait', b: '#1 대기', ln: 6, g: 'B도 1번부터 잡으려 한다. 그냥 줄을 선다 — 순환이 아니다' },
+          { l: 'A', t0: 300, t1: 400, k: 'sql', b: '#2 잠금', ln: 6, g: 'WHERE id = 2 FOR UPDATE  ->  획득', lock: 'p2' },
+          { l: 'A', t0: 420, t1: 510, k: 'app', b: 'decrease', ln: 7, g: '5 -> 4 두 상품 모두 차감', set: { stock: 4, stock2: 4 } },
+          { l: 'A', t0: 620, t1: 700, k: 'commit', b: 'COMMIT', ln: 10, g: 'COMMIT — 잠금 전부 해제', set: { orders: 1 }, unlock: true },
+          { l: 'B', t0: 700, t1: 800, k: 'sql', b: '#1 잠금', ln: 6, g: '획득', lock: 'p1' },
+          { l: 'B', t0: 830, t1: 930, k: 'sql', b: '#2 잠금', ln: 6, g: '획득', lock: 'p2' },
+          { l: 'B', t0: 950, t1: 1040, k: 'app', b: 'decrease', ln: 7, g: '4 -> 3 두 상품 모두 차감', set: { stock: 3, stock2: 3 } },
+          { l: 'B', t0: 1060, t1: 1140, k: 'commit', b: 'COMMIT', ln: 10, g: 'COMMIT — 둘 다 성공', set: { orders: 2 }, unlock: true }
+        ],
+        verdict: { v: 'ok', t: '두 트랜잭션 모두 성공했습니다 — 데드락 없음' },
+        metrics: ['B 대기 500틱', '강제 종료 0건']
+      }
+    }
+  ];
+</script>
+
+<script>
+(function () {
+  'use strict';
+
+  var $ = function (id) { return document.getElementById(id); };
+  var TICK_MS = 2.2;
+  var REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  var picker = $('picker'), scope = $('scope'), stage = $('stage'), ruler = $('ruler');
+  var laneEl = { A: $('laneA'), B: $('laneB') }, head = $('head');
+  var codeEl = $('code'), tapeEl = $('tape'), rowsEl = $('rows');
+  var ordN = $('ordN'), soldN = $('soldN'), overN = $('overN'), lab2 = $('lab2'), lab3 = $('lab3');
+  var verdictEl = $('verdict'), vtext = $('vtext'), vmetrics = $('vmetrics');
+  var playBtn = $('play'), stepBtn = $('step'), resetBtn = $('reset'), fixBtn = $('fix'), fixWrap = $('fixWrap');
+
+  var idx = 0, view = null, now = 0, playing = false, speed = 1, raf = 0, last = 0;
+  var gut = 104, ppt = 1, evNodes = [], holdNodes = [], bounds = [], useFixed = false;
+  var prevVals = {}, tapeCount = -1;
+
+  /* ---------- helpers ---------- */
+  function esc(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  var KW = /\b(public|private|protected|class|interface|extends|implements|void|new|throw|return|if|else|for|int|long|boolean|final|static|update|set|where|and|select|from)\b/g;
+  function hlCode(raw) {
+    var cut = raw.indexOf('//');
+    var codePart = cut >= 0 ? raw.slice(0, cut) : raw;
+    var cmPart = cut >= 0 ? raw.slice(cut) : '';
+    /* 먼저 표시만 심어 두고 마지막에 태그로 바꾼다 — 방금 만든 태그를 다시 매칭하지 않도록 */
+    var s = codePart
+      .replace(/(@[A-Za-z]\w*)/g, '\u0001an\u0002$1\u0003')
+      .replace(KW, '\u0001k\u0002$1\u0003')
+      .replace(/\b(\d+)\b/g, '\u0001nu\u0002$1\u0003');
+    s = esc(s).replace(/\u0001(\w+)\u0002/g, '<span class="$1">').replace(/\u0003/g, '</span>');
+    if (cmPart) s += '<span class="cm">' + esc(cmPart) + '</span>';
+    return s;
+  }
+  function viewOf(sc) {
+    if (sc.fixed && useFixed) {
+      var f = {};
+      Object.keys(sc).forEach(function (k) { f[k] = sc[k]; });
+      Object.keys(sc.fixed).forEach(function (k) { f[k] = sc.fixed[k]; });
+      f.bad = false;
+      return f;
+    }
+    return sc;
+  }
+
+  /* ---------- state replay ---------- */
+  function stateAt(t) {
+    var st = {
+      rows: view.init.rows.map(function (r) { return { id: r.id, label: r.label, stock: r.stock, version: r.version }; }),
+      orders: view.init.orders, holders: {}, killed: 0
+    };
+    view.ev.forEach(function (e) {
+      if (e.t1 > t) return;
+      if (e.set) {
+        if ('stock' in e.set) st.rows[0].stock = e.set.stock;
+        if ('stock2' in e.set && st.rows[1]) st.rows[1].stock = e.set.stock2;
+        if ('version' in e.set) st.rows[0].version = e.set.version;
+        if ('orders' in e.set) st.orders = e.set.orders;
+      }
+      if (e.lock) st.holders[e.lock] = e.l;
+      if (e.unlock) {
+        Object.keys(st.holders).forEach(function (k) { if (st.holders[k] === e.l) delete st.holders[k]; });
+      }
+      if (e.k === 'err' && e.b.indexOf('deadlock') >= 0) st.killed++;
+    });
+    return st;
+  }
+
+  /* ---------- build ---------- */
+  function layout() {
+    gut = window.innerWidth < 620 ? 76 : 104;
+    stage.style.setProperty('--gut', gut + 'px');
+    var avail = scope.clientWidth - gut;
+    var inner = Math.max(avail, 1120);
+    ppt = (inner - 2) / view.T;
+    stage.style.width = (gut + inner) + 'px';
+    ruler.innerHTML = '';
+    for (var t = 0; t <= view.T; t += 200) {
+      var d = document.createElement('div');
+      d.className = 'tick';
+      d.style.left = (t * ppt) + 'px';
+      d.innerHTML = '<s>' + t + '</s>';
+      ruler.appendChild(d);
+    }
+    evNodes.forEach(function (n) { n.el.style.left = (n.e.t0 * ppt) + 'px'; });
+    holdNodes.forEach(function (n) { n.el.style.left = (n.t0 * ppt) + 'px'; });
+  }
+
+  function build() {
+    laneEl.A.innerHTML = ''; laneEl.B.innerHTML = '';
+    evNodes = []; holdNodes = [];
+
+    view.ev.forEach(function (e) {
+      var el = document.createElement('div');
+      el.className = 'ev';
+      el.setAttribute('data-k', e.k);
+      el.textContent = e.b;
+      el.title = e.g;
+      el.style.display = 'none';
+      laneEl[e.l].appendChild(el);
+      evNodes.push({ e: e, el: el, shown: false });
+    });
+
+    /* 잠금 보유 구간 */
+    view.ev.forEach(function (e, i) {
+      if (!e.lock) return;
+      var end = view.T;
+      for (var j = i + 1; j < view.ev.length; j++) {
+        if (view.ev[j].l === e.l && view.ev[j].unlock) { end = view.ev[j].t1; break; }
+      }
+      var el = document.createElement('div');
+      el.className = 'hold';
+      el.setAttribute('data-lane', e.l);
+      el.style.display = 'none';
+      laneEl[e.l].appendChild(el);
+      holdNodes.push({ t0: e.t1, t1: end, el: el });
+    });
+
+    codeEl.innerHTML = view.code.map(function (line, i) {
+      return '<div class="cl" data-ln="' + (i + 1) + '"><span class="ln">' + (i + 1) +
+        '</span><span class="mk"></span><span class="src">' + (line === '' ? ' ' : hlCode(line)) + '</span></div>';
+    }).join('');
+
+    rowsEl.innerHTML = view.init.rows.map(function (r) {
+      return '<div data-row="' + r.id + '" style="margin-bottom:12px">' +
+        '<div style="font-family:var(--mono);font-size:11.5px;color:var(--ink2);margin-bottom:4px">' + esc(r.label) + '</div>' +
+        '<div class="fields">' +
+        '<div class="f"><span class="k">stock</span><span class="v" data-k="stock">' + r.stock + '</span></div>' +
+        (view.hasVersion ? '<div class="f"><span class="k">version</span><span class="v" data-k="version">' + r.version + '</span></div>' : '') +
+        '</div><div class="holder none" data-holder>잠금 없음</div></div>';
+    }).join('');
+
+    lab2.textContent = view.initStock === null ? '강제 종료' : '팔린 수량';
+    lab3.textContent = view.initStock === null ? '데드락' : '초과 판매';
+
+    var set = {};
+    view.ev.forEach(function (e) { set[e.t0] = 1; set[e.t1] = 1; });
+    set[view.T] = 1;
+    bounds = Object.keys(set).map(Number).sort(function (a, b) { return a - b; });
+
+    $('scName').textContent = view.title;
+    fixWrap.style.display = view.fixed || (SC[idx].fixed) ? '' : 'none';
+    prevVals = {}; tapeCount = -1;
+    layout();
+  }
+
+  /* ---------- paint ---------- */
+  function setVal(el, v) {
+    var key = el.getAttribute('data-vk') || (el.id || '') + (el.getAttribute('data-k') || '');
+    if (prevVals[key] !== undefined && prevVals[key] !== v && !REDUCED) {
+      el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+    }
+    prevVals[key] = v;
+    el.textContent = v;
+  }
+
+  function paint() {
+    var st = stateAt(now);
+
+    evNodes.forEach(function (n) {
+      var e = n.e;
+      if (now < e.t0) { n.el.style.display = 'none'; n.shown = false; return; }
+      if (!n.shown) { n.el.style.display = ''; if (!REDUCED) { n.el.classList.add('on'); } n.shown = true; }
+      var w = Math.min(now - e.t0, e.t1 - e.t0) * ppt;
+      n.el.style.width = Math.max(w, 2) + 'px';
+    });
+    holdNodes.forEach(function (n) {
+      if (now < n.t0) { n.el.style.display = 'none'; return; }
+      n.el.style.display = '';
+      n.el.style.width = Math.max(Math.min(now - n.t0, n.t1 - n.t0) * ppt, 2) + 'px';
+    });
+
+    var hx = gut + now * ppt;
+    head.style.left = hx + 'px';
+    if (playing && !REDUCED) {
+      var want = hx - scope.clientWidth * (window.innerWidth < 620 ? 0.8 : 0.62);
+      var max = stage.offsetWidth - scope.clientWidth;
+      if (max > 0) scope.scrollLeft = Math.max(0, Math.min(want, max));
+    }
+
+    /* 코드 하이라이트 */
+    var act = { A: 0, B: 0 };
+    view.ev.forEach(function (e) { if (now >= e.t0 && now < e.t1) act[e.l] = e.ln; });
+    Array.prototype.forEach.call(codeEl.children, function (row) {
+      var ln = +row.getAttribute('data-ln');
+      var a = act.A === ln, b = act.B === ln;
+      row.className = 'cl' + (a && b ? ' act-ab' : a ? ' act-a' : b ? ' act-b' : '');
+      row.children[1].textContent = a && b ? 'AB' : a ? 'A' : b ? 'B' : '';
+    });
+
+    /* 행 상태 */
+    st.rows.forEach(function (r) {
+      var box = rowsEl.querySelector('[data-row="' + r.id + '"]');
+      if (!box) return;
+      var sv = box.querySelector('[data-k="stock"]');
+      if (sv) { sv.setAttribute('data-vk', r.id + 'stock'); setVal(sv, r.stock); }
+      var vv = box.querySelector('[data-k="version"]');
+      if (vv) { vv.setAttribute('data-vk', r.id + 'ver'); setVal(vv, r.version); }
+      var h = box.querySelector('[data-holder]');
+      var who = st.holders[r.id];
+      h.className = 'holder' + (who ? '' : ' none');
+      if (who) { h.setAttribute('data-lane', who); h.textContent = '행 잠금 보유 · 사용자 ' + who; }
+      else { h.removeAttribute('data-lane'); h.textContent = '잠금 없음'; }
+    });
+
+    ordN.setAttribute('data-vk', 'ord'); setVal(ordN, st.orders);
+    if (view.initStock === null) {
+      soldN.setAttribute('data-vk', 'k'); setVal(soldN, st.killed);
+      overN.setAttribute('data-vk', 'd'); setVal(overN, st.killed ? '발생' : '없음');
+      overN.classList.toggle('bad', st.killed > 0);
+      soldN.classList.toggle('bad', st.killed > 0);
+    } else {
+      var sold = view.initStock - st.rows[0].stock;
+      var over = Math.max(0, st.orders - sold);
+      soldN.setAttribute('data-vk', 's'); setVal(soldN, sold);
+      overN.setAttribute('data-vk', 'o'); setVal(overN, over);
+      overN.classList.toggle('bad', over > 0);
+      soldN.classList.remove('bad');
+    }
+
+    /* 로그 테이프 */
+    var seen = view.ev.filter(function (e) { return now >= e.t0; });
+    if (seen.length !== tapeCount) {
+      tapeCount = seen.length;
+      tapeEl.innerHTML = seen.length === 0
+        ? '<div class="empty">아직 실행된 문장이 없습니다.</div>'
+        : seen.map(function (e) {
+            return '<div class="tl" data-lane="' + e.l + '" data-k="' + e.k + '">' +
+              '<span class="t">' + e.t0 + '</span><span class="w">' + e.l + '</span>' +
+              '<span class="m">' + esc(e.g) + '</span></div>';
+          }).join('');
+      tapeEl.scrollTop = tapeEl.scrollHeight;
+    }
+
+    /* 판정 */
+    if (now >= view.T - 0.5) {
+      verdictEl.setAttribute('data-v', view.verdict.v);
+      vtext.textContent = view.verdict.t;
+      vmetrics.innerHTML = view.metrics.map(function (m) { return '<span>' + esc(m) + '</span>'; }).join('');
+    } else {
+      verdictEl.setAttribute('data-v', 'idle');
+      vtext.textContent = now === 0 ? '재생 버튼을 누르세요' : '재생 중…';
+      vmetrics.innerHTML = '';
+    }
+  }
+
+  /* ---------- transport ---------- */
+  function loop(ts) {
+    if (!playing) return;
+    if (!last) last = ts;
+    var dt = Math.min(ts - last, 60); last = ts;
+    now += (dt / TICK_MS) * speed;
+    if (now >= view.T) { now = view.T; playing = false; playBtn.textContent = '▶ 다시 재생'; }
+    paint();
+    if (playing) raf = requestAnimationFrame(loop);
+  }
+  function play() {
+    if (now >= view.T) now = 0;
+    playing = true; last = 0; playBtn.textContent = '❚❚ 일시정지';
+    raf = requestAnimationFrame(loop);
+  }
+  function pause() { playing = false; cancelAnimationFrame(raf); playBtn.textContent = '▶ 재생'; }
+
+  playBtn.addEventListener('click', function () { playing ? pause() : play(); });
+  stepBtn.addEventListener('click', function () {
+    pause();
+    for (var i = 0; i < bounds.length; i++) { if (bounds[i] > now + 0.5) { now = bounds[i]; break; } }
+    if (now >= view.T) { now = view.T; playBtn.textContent = '▶ 다시 재생'; }
+    paint();
+  });
+  resetBtn.addEventListener('click', function () { pause(); now = 0; scope.scrollLeft = 0; paint(); });
+  Array.prototype.forEach.call(document.querySelectorAll('.spd'), function (b) {
+    b.addEventListener('click', function () {
+      speed = +b.getAttribute('data-s');
+      document.querySelectorAll('.spd').forEach(function (x) { x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+    });
+  });
+  fixBtn.addEventListener('click', function () {
+    useFixed = !useFixed;
+    fixBtn.setAttribute('aria-pressed', useFixed ? 'true' : 'false');
+    fixBtn.textContent = useFixed ? '✓ ID 오름차순으로 잠그는 중' : '잠금 순서를 ID 오름차순으로';
+    load(idx, true);
+  });
+
+  /* ---------- scenario switching ---------- */
+  function load(i, keepFix) {
+    idx = i;
+    if (!keepFix) { useFixed = false; fixBtn.setAttribute('aria-pressed', 'false'); fixBtn.textContent = '잠금 순서를 ID 오름차순으로'; }
+    view = viewOf(SC[i]);
+    pause(); now = 0; scope.scrollLeft = 0;
+    build(); paint();
+    Array.prototype.forEach.call(picker.children, function (b, j) {
+      b.setAttribute('aria-pressed', j === i ? 'true' : 'false');
+    });
+  }
+
+  picker.innerHTML = SC.map(function (sc, i) {
+    return '<button class="pick" type="button" aria-pressed="' + (i === 0 ? 'true' : 'false') + '"' +
+      (sc.bad ? ' data-bad="1"' : '') + ' data-i="' + i + '">' +
+      '<span class="no">' + sc.no + '</span>' +
+      '<span class="nm">' + esc(sc.nm) + '</span>' +
+      '<span class="tag">' + esc(sc.tag) + '</span></button>';
+  }).join('');
+  Array.prototype.forEach.call(picker.children, function (b) {
+    b.addEventListener('click', function () { load(+b.getAttribute('data-i')); });
+  });
+
+  var rz;
+  window.addEventListener('resize', function () {
+    clearTimeout(rz);
+    rz = setTimeout(function () { layout(); paint(); }, 120);
+  });
+
+  document.fonts && document.fonts.ready.then(function () { layout(); paint(); });
+  load(0);
+})();
+</script>
+
+</body>
+</html>
