@@ -1,0 +1,886 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>커넥션 하나의 생애</title>
+<meta name="description" content="트랜잭션을 여는 순간 커넥션 하나가 묶인다. 외부 API를 트랜잭션 안에 넣었을 때 풀 10칸과 대기 큐가 어떻게 되는지 눌러서 돌려 보는 페이지.">
+<meta name="author" content="DuckVeloper">
+<meta property="og:type" content="website">
+<meta property="og:title" content="커넥션 하나의 생애">
+<meta property="og:description" content="PostgreSQL 17.11에서 잰 값으로 만든 커넥션 풀·MVCC 재현기.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%8C%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=swap">
+<style>
+:root{
+  --ground:#eceff0; --paper:#f7f9f9; --sunk:#e2e7e7;
+  --ink:#0f1e1d; --ink2:#52625f; --ink3:#7b8a87;
+  --rule:#ccd7d5; --rule2:#dde5e4;
+  --a:#0d6f6b; --a-soft:#d6eae9; --a-line:#0d6f6b;
+  --b:#b04617; --b-soft:#f7e3d7; --b-line:#b04617;
+  --lock:#6a4fa3; --lock-soft:#e7e1f4;
+  --alarm:#bd1130; --alarm-soft:#f9dde1;
+  --ok:#1c6b45;
+  --shadow:0 1px 2px rgba(15,30,29,.06), 0 8px 24px -18px rgba(15,30,29,.35);
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --sans:"IBM Plex Sans KR","IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic",sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0b1211; --paper:#131d1c; --sunk:#0e1716;
+    --ink:#e2ecea; --ink2:#8ba09d; --ink3:#6b807d;
+    --rule:#273836; --rule2:#1d2b2a;
+    --a:#46d2cb; --a-soft:#123230; --a-line:#46d2cb;
+    --b:#ff9455; --b-soft:#33200f; --b-line:#ff9455;
+    --lock:#ab8df2; --lock-soft:#241d3a;
+    --alarm:#ff5f72; --alarm-soft:#391219;
+    --ok:#57c48b;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -20px rgba(0,0,0,.9);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0b1211; --paper:#131d1c; --sunk:#0e1716;
+  --ink:#e2ecea; --ink2:#8ba09d; --ink3:#6b807d;
+  --rule:#273836; --rule2:#1d2b2a;
+  --a:#46d2cb; --a-soft:#123230; --a-line:#46d2cb;
+  --b:#ff9455; --b-soft:#33200f; --b-line:#ff9455;
+  --lock:#ab8df2; --lock-soft:#241d3a;
+  --alarm:#ff5f72; --alarm-soft:#391219;
+  --ok:#57c48b;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -20px rgba(0,0,0,.9);
+}
+
+*{box-sizing:border-box; margin:0; padding:0}
+img,svg{display:block; max-width:100%}
+html{-webkit-text-size-adjust:100%}
+body{
+  background:var(--ground); color:var(--ink);
+  font-family:var(--sans); font-size:16px; line-height:1.68;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px; margin:0 auto; padding:clamp(28px,5vw,64px) clamp(16px,4vw,32px) 80px}
+h1,h2,h3{text-wrap:balance; margin:0}
+:focus-visible{outline:2px solid var(--a); outline-offset:2px; border-radius:3px}
+
+/* ---------- header ---------- */
+.eyebrow{
+  font-family:var(--mono); font-size:11.5px; font-weight:500;
+  letter-spacing:.16em; text-transform:uppercase; color:var(--ink3);
+}
+h1{font-size:clamp(34px,6.4vw,58px); font-weight:700; letter-spacing:-.035em; line-height:1.06; margin:14px 0 0}
+.lede{margin:20px 0 0; max-width:62ch; font-size:clamp(15px,1.6vw,17px); color:var(--ink2)}
+.lede b{color:var(--ink); font-weight:600}
+.rig{
+  display:flex; flex-wrap:wrap; gap:8px 18px; margin:26px 0 0;
+  padding-top:16px; border-top:1px solid var(--rule);
+  font-family:var(--mono); font-size:12px; color:var(--ink3);
+}
+.rig span b{color:var(--ink2); font-weight:500}
+
+/* ---------- scenario selector ---------- */
+.track{margin:44px 0 0}
+.track-head{display:flex; align-items:baseline; justify-content:space-between; gap:16px; margin-bottom:12px}
+@media (max-width:620px){ .track-head .eyebrow+.eyebrow{display:none} }
+.picker{display:grid; grid-template-columns:repeat(3,1fr); gap:8px}
+.picker>*{min-width:0}
+@media (max-width:700px){ .picker{grid-template-columns:1fr} }
+.pick{
+  appearance:none; text-align:left; cursor:pointer;
+  background:var(--paper); color:var(--ink);
+  border:1px solid var(--rule); border-radius:2px;
+  padding:11px 12px 12px; display:flex; flex-direction:column; gap:5px;
+  font-family:inherit; transition:border-color .15s, background .15s;
+}
+.pick:hover{border-color:var(--ink3)}
+.pick .no{font-family:var(--mono); font-size:10.5px; letter-spacing:.14em; color:var(--ink3); text-transform:uppercase}
+.pick .nm{font-size:14px; font-weight:600; letter-spacing:-.01em; line-height:1.3}
+.pick .tag{font-family:var(--mono); font-size:11px; color:var(--ink3)}
+.pick[aria-pressed="true"]{background:var(--ink); color:var(--ground); border-color:var(--ink)}
+.pick[aria-pressed="true"] .no,.pick[aria-pressed="true"] .tag{color:var(--ground); opacity:.62}
+.pick[data-bad="1"] .tag{color:var(--alarm)}
+.pick[aria-pressed="true"][data-bad="1"] .tag{color:var(--ground); opacity:.75}
+
+/* ---------- panel ---------- */
+.panel{background:var(--paper); border:1px solid var(--rule); border-radius:3px; box-shadow:var(--shadow); margin-top:14px}
+.panel-bar{display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:11px 14px; border-bottom:1px solid var(--rule2)}
+.panel-title{font-family:var(--mono); font-size:11.5px; letter-spacing:.13em; text-transform:uppercase; color:var(--ink3)}
+.legend{display:flex; gap:14px; margin-left:auto; flex-wrap:wrap}
+.lg{display:flex; align-items:center; gap:6px; font-family:var(--mono); font-size:11px; color:var(--ink2)}
+.lg i{width:14px; height:9px; border-radius:1px; display:block; border:1px solid var(--rule)}
+.lg.hot i{background:var(--alarm-soft); border-color:var(--alarm)}
+.lg.db i{background:var(--a-soft); border-color:var(--a)}
+.lg.api i{background:var(--b-soft); border-color:var(--b)}
+.pbody{padding:14px}
+
+/* ---------- 트랜잭션 해부: 단계 칩 ---------- */
+.scope{overflow-x:auto; overflow-y:hidden; scrollbar-width:thin}
+.chips{display:flex; gap:6px; align-items:stretch; min-width:min-content; padding-bottom:2px}
+.ev{
+  border-radius:2px; border:1px solid transparent; padding:7px 9px 8px;
+  display:flex; flex-direction:column; gap:2px; white-space:nowrap;
+  font-family:var(--mono); min-width:74px;
+}
+.ev .st{font-size:9.5px; letter-spacing:.1em; opacity:.75}
+.ev .nm{font-size:11.5px; font-weight:500}
+.ev .ms{font-size:10.5px; opacity:.8; font-variant-numeric:tabular-nums}
+.ev[data-k="conn"]{background:var(--lock-soft); border-color:var(--lock); color:var(--lock)}
+.ev[data-k="sql"]{background:var(--a-soft); border-color:var(--a-line); color:var(--a)}
+.ev[data-k="app"]{background:transparent; border-color:var(--a-line); border-style:dashed; color:var(--a)}
+.ev[data-k="hot"]{background:var(--alarm-soft); border-color:var(--alarm); color:var(--alarm)}
+.ev[data-k="api"]{background:var(--b-soft); border-color:var(--b-line); color:var(--b); min-width:150px}
+.ev.live{box-shadow:0 0 0 2px var(--ink); position:relative}
+.holdbar{position:relative; margin-top:8px; height:26px; min-width:min-content}
+.holdspan{
+  position:absolute; top:6px; height:3px; background:var(--lock); border-radius:2px;
+}
+.holdspan::before,.holdspan::after{
+  content:""; position:absolute; top:-4px; width:1px; height:11px; background:var(--lock);
+}
+.holdspan::before{left:0} .holdspan::after{right:0}
+.holdlab{position:absolute; top:12px; font-family:var(--mono); font-size:10.5px; color:var(--lock); white-space:nowrap}
+
+/* ---------- to-scale 비교 막대 ---------- */
+.cmp{margin-top:16px; padding-top:14px; border-top:1px solid var(--rule2)}
+.cmp h4{font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--ink3); font-weight:500; margin-bottom:10px}
+.cmprow{display:flex; align-items:center; gap:10px; margin-bottom:7px}
+.cmprow .cl2{flex:0 0 130px; font-size:12.5px; color:var(--ink2); text-align:right}
+.cmprow .bar{flex:1 1 auto; min-width:0; height:18px; background:var(--sunk); border-radius:2px; overflow:hidden}
+.cmprow .bar i{display:block; height:100%; background:var(--a)}
+.cmprow[data-hot="1"] .bar i{background:var(--alarm)}
+.cmprow .val{flex:0 0 86px; font-family:var(--mono); font-size:12px; font-variant-numeric:tabular-nums; color:var(--ink2)}
+.cmprow[data-hot="1"] .val{color:var(--alarm); font-weight:600}
+.cmprow.cur .cl2{color:var(--ink); font-weight:600}
+@media (max-width:560px){ .cmprow .cl2{flex-basis:96px; font-size:11.5px} .cmprow .val{flex-basis:74px; font-size:11px} }
+</style>
+<style>
+/* ---------- 커넥션 풀 보드 ---------- */
+.board{display:grid; grid-template-columns:1fr 260px; gap:16px; align-items:start}
+.board>*{min-width:0}
+@media (max-width:820px){ .board{grid-template-columns:1fr} }
+
+.slots{display:grid; grid-template-columns:repeat(5,1fr); gap:7px}
+.slots>*{min-width:0}
+.slot{
+  position:relative; height:60px; border:1px solid var(--rule); border-radius:3px;
+  background:var(--sunk); overflow:hidden;
+}
+.slot .fill{position:absolute; inset:0; background:var(--a); opacity:0; transition:opacity .12s linear}
+.slot[data-hot="1"] .fill{background:var(--alarm)}
+.slot .sl{
+  position:absolute; left:6px; top:4px; font-family:var(--mono); font-size:10px;
+  color:var(--ink3); z-index:2;
+}
+.slot .held{
+  position:absolute; left:6px; right:6px; bottom:5px; z-index:2;
+  font-family:var(--mono); font-size:11px; font-variant-numeric:tabular-nums;
+  color:var(--ink2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.slot[data-on="1"] .sl,.slot[data-on="1"] .held{color:var(--paper)}
+@media (max-width:760px){ .slot .held{font-size:10px} .slot{height:56px} }
+.slot[data-on="1"]{border-color:var(--a)}
+.slot[data-hot="1"]{border-color:var(--alarm)}
+@media (prefers-reduced-motion:reduce){ .slot .fill{transition:none} }
+
+.qbox{border:1px solid var(--rule); border-radius:3px; padding:12px 13px; background:var(--sunk)}
+.qbox h4{font-family:var(--mono); font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:var(--ink3); font-weight:500}
+.qnum{font-family:var(--mono); font-size:34px; font-weight:600; line-height:1.1; font-variant-numeric:tabular-nums; letter-spacing:-.02em; margin-top:2px}
+.qnum.bad{color:var(--alarm)}
+.qtrack{height:10px; background:var(--paper); border:1px solid var(--rule); border-radius:2px; overflow:hidden; margin-top:8px}
+.qtrack i{display:block; height:100%; background:var(--lock); width:0}
+.qtrack.bad i{background:var(--alarm)}
+.qdots{display:flex; flex-wrap:wrap; gap:3px; margin-top:9px}
+.qdots s{width:7px; height:7px; border-radius:50%; background:var(--lock); text-decoration:none; display:block; opacity:.85}
+.qnote{font-family:var(--mono); font-size:10.5px; color:var(--ink3); margin-top:8px}
+
+/* ---------- transport ---------- */
+.transport{display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:11px 14px; border-top:1px solid var(--rule2)}
+.btn{
+  appearance:none; cursor:pointer; font-family:var(--mono); font-size:12px; font-weight:500;
+  letter-spacing:.03em; color:var(--ink); background:var(--ground);
+  border:1px solid var(--rule); border-radius:2px; padding:7px 13px;
+  transition:background .14s,border-color .14s,color .14s;
+}
+.btn:hover{border-color:var(--ink3)}
+.btn.primary{background:var(--ink); color:var(--ground); border-color:var(--ink); min-width:96px}
+.btn.primary:hover{opacity:.88}
+.clock{margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--ink3); font-variant-numeric:tabular-nums}
+.speeds{display:flex; border:1px solid var(--rule); border-radius:2px; overflow:hidden}
+.speeds .btn{border:0; border-radius:0; padding:7px 10px; background:transparent}
+.speeds .btn[aria-pressed="true"]{background:var(--sunk); color:var(--ink)}
+
+/* ---------- readout ---------- */
+.readout{display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:14px}
+.readout>*{min-width:0}
+@media (max-width:700px){ .readout{grid-template-columns:1fr 1fr} }
+.rowcard{background:var(--paper); border:1px solid var(--rule); border-radius:3px; padding:13px 14px; box-shadow:var(--shadow)}
+.rowcard h3{font-family:var(--mono); font-size:11px; letter-spacing:.13em; text-transform:uppercase; color:var(--ink3); font-weight:500; margin-bottom:8px}
+.f .v{font-family:var(--mono); font-size:26px; font-weight:600; line-height:1.15; font-variant-numeric:tabular-nums; letter-spacing:-.02em; display:block}
+.f .v small{font-size:14px; font-weight:400; color:var(--ink3)}
+.f .v.bad{color:var(--alarm)}
+.f .sub{font-family:var(--mono); font-size:10.5px; color:var(--ink3); display:block; margin-top:2px}
+
+.verdict{
+  display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:10px;
+  padding:13px 16px; background:var(--paper);
+  border:1px solid var(--rule); border-left:3px solid var(--rule); border-radius:3px; box-shadow:var(--shadow);
+}
+.verdict[data-v="bad"]{border-left-color:var(--alarm); background:var(--alarm-soft)}
+.verdict[data-v="ok"]{border-left-color:var(--ok)}
+.verdict[data-v="idle"]{opacity:.6}
+.verdict .vl{font-family:var(--mono); font-size:11px; letter-spacing:.13em; text-transform:uppercase; color:var(--ink3)}
+.verdict .vt{font-size:15px; font-weight:600; letter-spacing:-.01em}
+.verdict[data-v="bad"] .vt{color:var(--alarm)}
+.verdict[data-v="ok"] .vt{color:var(--ok)}
+.verdict .vm{margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--ink2); display:flex; gap:16px; flex-wrap:wrap}
+
+.prev{margin-top:10px; background:var(--paper); border:1px solid var(--rule); border-radius:3px; padding:12px 14px; box-shadow:var(--shadow)}
+.prev h3{font-family:var(--mono); font-size:11px; letter-spacing:.13em; text-transform:uppercase; color:var(--ink3); font-weight:500; margin-bottom:8px}
+.prevwrap{overflow-x:auto}
+.prev table{min-width:440px}
+.prev .empty{font-family:var(--mono); font-size:11.5px; color:var(--ink3)}
+
+/* ---------- code + mvcc ---------- */
+.split{display:grid; grid-template-columns:1.25fr 1fr; gap:10px; margin-top:10px; align-items:start}
+.split>*{min-width:0}
+@media (max-width:860px){ .split{grid-template-columns:1fr} }
+pre.code{margin:0; overflow-x:auto; font-family:var(--mono); font-size:12.5px; line-height:1.72; padding:12px 0 14px; tab-size:4}
+.cl{display:flex; padding:0 14px 0 0; border-left:3px solid transparent; transition:background .12s}
+.cl .ln{flex:0 0 34px; text-align:right; padding-right:10px; color:var(--ink3); opacity:.55; user-select:none; font-variant-numeric:tabular-nums}
+.cl .src{white-space:pre; color:var(--ink)}
+.cl.act{background:var(--a-soft); border-left-color:var(--a)}
+.cl.act-hot{background:var(--b-soft); border-left-color:var(--b)}
+.k{color:var(--lock)} .an{color:var(--b)} .cm{color:var(--ink3); font-style:italic} .nu{color:var(--a)}
+
+.mv{padding:13px 14px}
+.mvrow{
+  display:flex; align-items:center; gap:9px; padding:8px 10px; margin-bottom:6px;
+  border:1px solid var(--rule); border-radius:3px; background:var(--sunk);
+  font-family:var(--mono); font-size:11.5px; color:var(--ink2);
+}
+.mvrow.live{border-color:var(--a); background:var(--a-soft); color:var(--a)}
+.mvrow.dead{border-style:dashed; opacity:.7; text-decoration:line-through; text-decoration-color:var(--ink3)}
+.mvrow b{font-weight:600}
+.mvrow .badge{margin-left:auto; font-size:10px; letter-spacing:.08em; text-transform:uppercase; opacity:.85; text-decoration:none; display:inline-block}
+.mvbtns{display:flex; gap:6px; flex-wrap:wrap; margin-top:10px}
+.mvnote{font-size:12.5px; color:var(--ink2); margin-top:11px; line-height:1.6}
+.mvnote b{color:var(--ink); font-weight:600}
+
+/* ---------- prose ---------- */
+section.prose{margin-top:64px}
+section.prose h2{font-size:clamp(21px,2.8vw,27px); font-weight:700; letter-spacing:-.028em; line-height:1.25; padding-top:20px; border-top:1px solid var(--rule)}
+section.prose p{margin:14px 0 0; max-width:66ch; color:var(--ink2)}
+section.prose p b{color:var(--ink); font-weight:600}
+.tblwrap{overflow-x:auto; margin-top:22px; border:1px solid var(--rule); border-radius:3px; background:var(--paper); box-shadow:var(--shadow)}
+table{border-collapse:collapse; width:100%; min-width:560px; font-size:13.5px}
+th,td{padding:11px 14px; text-align:left; border-bottom:1px solid var(--rule2); vertical-align:top}
+thead th{font-family:var(--mono); font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:var(--ink3); font-weight:500; background:var(--sunk)}
+tbody tr:last-child td{border-bottom:0}
+td.nm{font-weight:600; color:var(--ink); white-space:nowrap}
+td.mono{font-family:var(--mono); font-size:12.5px; font-variant-numeric:tabular-nums}
+.bad{color:var(--alarm); font-weight:600} .good{color:var(--ok); font-weight:600}
+
+footer{
+  margin-top:72px; padding-top:22px; border-top:1px solid var(--rule);
+  display:flex; gap:18px; flex-wrap:wrap; align-items:baseline;
+  font-family:var(--mono); font-size:12px; color:var(--ink3);
+}
+footer a{color:var(--ink2); text-decoration:none; border-bottom:1px solid var(--rule)}
+footer a:hover{color:var(--ink); border-bottom-color:var(--ink3)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">FlashOrder · 커넥션 풀 재현기</div>
+    <h1>커넥션 하나의 생애</h1>
+    <p class="lede">
+      <code style="font-family:var(--mono);font-size:.92em">@Transactional</code>을 붙이는 순간
+      <b>커넥션 하나가 묶입니다.</b> 언제 풀리는지가 그 서버의 처리량을 정합니다.
+      결제 API 한 줄을 트랜잭션 안에 두느냐 밖에 두느냐로 풀 10칸이 어떻게 되는지
+      아래에서 직접 돌려 보세요.
+    </p>
+    <div class="rig">
+      <span><b>PostgreSQL 17.11</b></span>
+      <span>풀 크기 <b>10</b></span>
+      <span>요청 <b>40건</b> · 20ms 간격</span>
+      <span>숫자는 전부 실측값</span>
+    </div>
+  </header>
+
+  <div class="track">
+    <div class="track-head">
+      <div class="eyebrow">시나리오 선택</div>
+      <div class="eyebrow" style="color:var(--ink2)">02와 03을 번갈아 눌러 보면 보드가 완전히 달라집니다</div>
+    </div>
+    <div class="picker" id="picker" role="group" aria-label="시나리오 선택"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-bar">
+      <span class="panel-title" id="anaTitle">트랜잭션 해부</span>
+      <div class="legend">
+        <span class="lg db"><i></i>DB 작업</span>
+        <span class="lg api"><i></i>외부 API</span>
+        <span class="lg hot"><i></i>다른 요청과 부딪히는 구간</span>
+      </div>
+    </div>
+    <div class="pbody">
+      <div class="scope">
+        <div class="chips" id="chips"></div>
+        <div class="holdbar" id="holdbar"></div>
+      </div>
+      <div class="cmp">
+        <h4>커넥션을 잡고 있는 시간 — 같은 축으로</h4>
+        <div id="cmp"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-bar">
+      <span class="panel-title">커넥션 풀 보드 · pool size 10</span>
+    </div>
+    <div class="pbody">
+      <div class="board">
+        <div>
+          <div class="slots" id="slots"></div>
+        </div>
+        <div class="qbox">
+          <h4>대기 큐</h4>
+          <div class="qnum" id="qnum">0</div>
+          <div class="qtrack" id="qtrack"><i></i></div>
+          <div class="qdots" id="qdots"></div>
+          <div class="qnote" id="qnote">풀이 비어 있으면 요청은 기다리지 않습니다</div>
+        </div>
+      </div>
+    </div>
+    <div class="transport">
+      <button class="btn primary" id="play">▶ 재생</button>
+      <button class="btn" id="step">한 스텝 →</button>
+      <button class="btn" id="reset">↺ 처음으로</button>
+      <span class="clock" id="clock">0 ms</span>
+      <div class="speeds" role="group" aria-label="재생 속도">
+        <button class="btn spd" data-s="0.5" aria-pressed="false">0.5×</button>
+        <button class="btn spd" data-s="1" aria-pressed="true">1×</button>
+        <button class="btn spd" data-s="2" aria-pressed="false">2×</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="readout">
+    <div class="rowcard"><h3>점유 중인 커넥션</h3>
+      <div class="f"><span class="v" id="cOcc">0<small> / 10</small></span><span class="sub" id="sOcc">풀에서 빌려 간 수</span></div>
+    </div>
+    <div class="rowcard"><h3>대기 큐 길이</h3>
+      <div class="f"><span class="v" id="cQ">0</span><span class="sub" id="sQ">커넥션을 못 받고 줄 선 요청</span></div>
+    </div>
+    <div class="rowcard"><h3>최대 대기 시간</h3>
+      <div class="f"><span class="v" id="cW">0<small> ms</small></span><span class="sub" id="sW">가장 오래 기다린 요청</span></div>
+    </div>
+  </div>
+
+  <div class="verdict" id="verdict" data-v="idle">
+    <span class="vl">판정</span>
+    <span class="vt" id="vtext">재생 버튼을 누르세요</span>
+    <span class="vm" id="vmetrics"></span>
+  </div>
+
+  <div class="prev">
+    <h3>직전 실행 결과 — 시나리오를 바꿔 가며 비교하세요</h3>
+    <div class="prevwrap"><div id="prevBody"><span class="empty">아직 끝까지 돌린 시나리오가 없습니다.</span></div></div>
+  </div>
+
+  <div class="split">
+    <div class="panel" style="margin-top:0">
+      <div class="panel-bar"><span class="panel-title">지금 실행 중인 코드</span></div>
+      <pre class="code" id="code"></pre>
+    </div>
+    <div class="panel" style="margin-top:0">
+      <div class="panel-bar"><span class="panel-title">MVCC · 행 버전</span></div>
+      <div class="mv">
+        <div id="mvrows"></div>
+        <div class="mvbtns">
+          <button class="btn" id="mvUpdate">UPDATE 실행</button>
+          <button class="btn" id="mvVacuum">VACUUM</button>
+          <button class="btn" id="mvReset">초기화</button>
+        </div>
+        <p class="mvnote">
+          UPDATE는 그 행을 고치지 않습니다. 옛 버전에 <b>xmax</b>를 찍어 죽은 것으로 표시하고
+          <b>새 버전을 통째로 씁니다.</b> 그래서 읽는 쪽은 옛 버전을 그대로 보고,
+          <b>읽기가 쓰기를 막지 않습니다.</b> 갱신 유실이 생기는 이유도 같은 성질입니다 —
+          두 세션이 같은 옛 버전을 나란히 읽을 수 있으니까요.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <section class="prose">
+    <h2>이 페이지의 숫자는 실제로 잰 값입니다</h2>
+    <p>
+      아래는 도커에 띄운 <b>PostgreSQL 17.11</b>에 <code>pgbench</code>로 부하를 넣어 직접 측정한 값입니다.
+      인용이 아니라 실측이고, 재현기의 단계 길이도 이 값에서 나왔습니다.
+    </p>
+    <div class="tblwrap">
+      <table>
+        <thead><tr><th>무엇을</th><th>조건 A</th><th>조건 B</th><th>차이</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="nm">커넥션</td>
+            <td class="mono">재사용 0.469 ms<br>42,616 TPS</td>
+            <td class="mono">매번 새로 6.405 ms<br>3,122 TPS</td>
+            <td class="mono bad">13.6배</td>
+          </tr>
+          <tr>
+            <td class="nm">버퍼 캐시</td>
+            <td class="mono">1회차 13.161 ms<br>shared hit=333 read=578</td>
+            <td class="mono">2회차 0.844 ms<br>shared hit=911 read=0</td>
+            <td class="mono good">15.6배</td>
+          </tr>
+          <tr>
+            <td class="nm">COMMIT</td>
+            <td class="mono">synchronous_commit=on<br>30,395 TPS</td>
+            <td class="mono">off<br>78,656 TPS</td>
+            <td class="mono">2.6배</td>
+          </tr>
+          <tr>
+            <td class="nm">WAL 생성량</td>
+            <td class="mono">INSERT 1,000건<br>405 kB</td>
+            <td class="mono">UPDATE 1,000건<br>479 kB</td>
+            <td class="mono bad">UPDATE가 더 크다</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      커넥션 하나 여는 데 약 <b>6ms</b>가 듭니다. 풀을 쓰는 이유가 여기 있고, 동시에
+      <b>풀 크기가 곧 동시에 열 수 있는 트랜잭션 수</b>라는 뜻이기도 합니다. 위 보드에서 10칸이 다 차는 순간
+      열한 번째 요청은 DB가 느려서가 아니라 <b>빌릴 커넥션이 없어서</b> 기다립니다.
+    </p>
+    <p>
+      WAL 줄을 보면 <code>UPDATE</code> 1,000건이 <code>INSERT</code> 1,000건보다 큽니다(479 kB vs 405 kB).
+      한 건 고치는 데 새 행을 통째로 쓰기 때문이고, 그게 오른쪽 MVCC 패널에서 눈으로 보이는 그 동작입니다.
+      INSERT 한 건은 <b>432 bytes</b>였습니다.
+    </p>
+  </section>
+
+  <footer>
+    <span>FlashOrder — 시니어 백엔드 시리즈 부록</span>
+    <a href="https://seungwon08.tistory.com" target="_blank" rel="noopener">seungwon08.tistory.com</a>
+    <span style="margin-left:auto">PostgreSQL 17.11 · 2026-08-28 측정</span>
+  </footer>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  var POOL = 10, REQS = 40, GAP = 20;   // 풀 10칸 · 요청 40건 · 20ms 간격
+
+  /* 단계 길이는 실측에서 왔다: 커넥션 획득 ~0.5ms(풀), COMMIT 은 fsync 대기가 붙어 가장 길다 */
+  function db(lns) {
+    return [
+      { n: '커넥션 획득',   ms: 1,  k: 'conn', ln: lns[0], hold: true },
+      { n: 'BEGIN',        ms: 1,  k: 'sql',  ln: lns[0], hold: true },
+      { n: 'SQL 생성',     ms: 2,  k: 'app',  ln: lns[1], hold: true },
+      { n: 'Parser',       ms: 1,  k: 'sql',  ln: lns[1], hold: true },
+      { n: 'Planner',      ms: 3,  k: 'sql',  ln: lns[1], hold: true },
+      { n: 'Executor',     ms: 8,  k: 'sql',  ln: lns[1], hold: true },
+      { n: '행 잠금',      ms: 5,  k: 'hot',  ln: lns[2], hold: true },
+      { n: 'WAL 기록',     ms: 6,  k: 'hot',  ln: lns[3], hold: true },
+      { n: 'COMMIT·fsync', ms: 17, k: 'hot',  ln: lns[3], hold: true }
+    ];
+  }
+  var API = { n: 'paymentClient.pay()', ms: 3000, k: 'api' };
+
+  var SC = [
+    {
+      id: 'ok', no: '01', nm: '정상', short: '정상', tag: '트랜잭션 안엔 DB만', bad: false,
+      title: '트랜잭션 해부 — 안에 DB 작업만 있을 때',
+      code: [
+        '@Transactional',
+        'public void order(OrderCommand cmd) {',
+        '    orderRepository.save(Order.of(cmd));',
+        '    productRepository.decreaseStock(cmd.productId());',
+        '}'
+      ],
+      phases: db([2, 3, 4, 5]),
+      verdict: { v: 'ok', t: '풀 10칸으로 충분했습니다 — 줄을 선 요청이 없습니다' }
+    },
+    {
+      id: 'inside', no: '02', nm: '외부 API를 트랜잭션 안에', short: 'API 안에', tag: '커넥션 3초 점유', bad: true,
+      title: '트랜잭션 해부 — 결제 API가 트랜잭션 안에 있을 때',
+      code: [
+        '@Transactional',
+        'public void order(OrderCommand cmd) {',
+        '    orderRepository.save(Order.of(cmd));',
+        '',
+        '    paymentClient.pay(cmd);        // 외부 결제 API · 3초',
+        '',
+        '    productRepository.decreaseStock(cmd.productId());',
+        '}'
+      ],
+      phases: (function () {
+        var p = db([2, 3, 7, 8]);
+        var api = { n: API.n, ms: API.ms, k: 'api', ln: 5, hold: true };
+        return p.slice(0, 5).concat([api], p.slice(5));   // Planner 다음에 끼어든다
+      })(),
+      verdict: { v: 'bad', t: '커넥션 10칸이 전부 3초씩 묶였습니다 — 나머지는 전부 대기' }
+    },
+    {
+      id: 'outside', no: '03', nm: '외부 API를 트랜잭션 밖으로', short: 'API 밖으로', tag: '커넥션은 44ms만', bad: false,
+      title: '트랜잭션 해부 — 결제 API를 트랜잭션 밖에서 부를 때',
+      code: [
+        'public void order(OrderCommand cmd) {',
+        '    PaymentResult r = paymentClient.pay(cmd);   // 트랜잭션 밖 · 3초',
+        '    orderService.persist(cmd, r);',
+        '}',
+        '',
+        '@Transactional',
+        'void persist(OrderCommand cmd, PaymentResult r) {',
+        '    orderRepository.save(Order.of(cmd, r));',
+        '    productRepository.decreaseStock(cmd.productId());',
+        '}'
+      ],
+      phases: [{ n: API.n, ms: API.ms, k: 'api', ln: 2, hold: false }]
+        .concat(db([7, 8, 9, 10])),
+      verdict: { v: 'ok', t: '같은 3초 호출인데 커넥션은 44ms만 잡았습니다' }
+    }
+  ];
+
+  /* ---------- 시뮬레이션: 한 번만 돌려 두고 시각별로 되짚는다 ---------- */
+  function simulate(sc) {
+    var hold = 0, pre = 0;
+    sc.phases.forEach(function (p) { if (p.hold) hold += p.ms; else pre += p.ms; });
+
+    var free = [], i, j;
+    for (i = 0; i < POOL; i++) free.push(0);
+    var reqs = [];
+    for (i = 0; i < REQS; i++) {
+      var arrive = i * GAP;
+      var ready = arrive + pre;              // 커넥션을 달라고 하는 시각
+      var si = 0;
+      for (j = 1; j < POOL; j++) if (free[j] < free[si]) si = j;
+      var acquire = Math.max(ready, free[si]);
+      free[si] = acquire + hold;
+      reqs.push({ i: i, arrive: arrive, ready: ready, acquire: acquire,
+                  release: acquire + hold, slot: si, wait: acquire - ready });
+    }
+    var last = 0;
+    reqs.forEach(function (r) { if (r.release > last) last = r.release; });
+
+    // 0번 요청의 단계별 구간 (코드 하이라이트·칩 강조용)
+    var tl = [], cur = reqs[0].arrive;
+    sc.phases.forEach(function (p) {
+      if (!p.hold) { tl.push({ p: p, t0: cur, t1: cur + p.ms }); cur += p.ms; }
+    });
+    cur = reqs[0].acquire;
+    sc.phases.forEach(function (p) {
+      if (p.hold) { tl.push({ p: p, t0: cur, t1: cur + p.ms }); cur += p.ms; }
+    });
+
+    var bset = {};
+    reqs.forEach(function (r) { bset[r.arrive] = 1; bset[r.ready] = 1; bset[r.acquire] = 1; bset[r.release] = 1; });
+    tl.forEach(function (e) { bset[e.t0] = 1; bset[e.t1] = 1; });
+    var span = last + 400;
+    bset[span] = 1;
+
+    return {
+      hold: hold, pre: pre, reqs: reqs, tl: tl, span: span,
+      bounds: Object.keys(bset).map(Number).sort(function (a, b) { return a - b; })
+    };
+  }
+  SC.forEach(function (sc) { sc.sim = simulate(sc); });
+  var MAXHOLD = Math.max.apply(null, SC.map(function (s) { return s.sim.hold; }));
+
+  function stateAt(sc, t) {
+    var sim = sc.sim, occ = [], q = 0, maxWait = 0, served = 0;
+    for (var s = 0; s < POOL; s++) occ.push(null);
+    sim.reqs.forEach(function (r) {
+      if (r.acquire <= t && t < r.release) occ[r.slot] = r;
+      if (r.ready <= t && t < r.acquire) q++;
+      if (r.acquire <= t && r.wait > maxWait) maxWait = r.wait;
+      if (r.release <= t) served++;
+    });
+    return { occ: occ, q: q, maxWait: maxWait, served: served };
+  }
+
+  /* ---------- 화면 ---------- */
+  var picker = $('picker'), chipsEl = $('chips'), holdbarEl = $('holdbar'), cmpEl = $('cmp');
+  var slotsEl = $('slots'), qnum = $('qnum'), qtrack = $('qtrack'), qdots = $('qdots'), qnote = $('qnote');
+  var codeEl = $('code'), clockEl = $('clock');
+  var cOcc = $('cOcc'), cQ = $('cQ'), cW = $('cW'), sOcc = $('sOcc'), sQ = $('sQ'), sW = $('sW');
+  var verdictEl = $('verdict'), vtext = $('vtext'), vmetrics = $('vmetrics'), prevBody = $('prevBody');
+  var playBtn = $('play'), stepBtn = $('step'), resetBtn = $('reset');
+
+  var sc = SC[0], now = 0, playing = false, speed = 1, raf = 0, last = 0;
+  var chipNodes = [], slotNodes = [], done = {};
+
+  function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function n(v) { return Math.round(v).toLocaleString('en-US'); }
+
+  var KW = /\b(public|private|void|class|new|return|if|else|for|int|long|final|static)\b/g;
+  function hlCode(raw) {
+    var cut = raw.indexOf('//');
+    var codePart = cut >= 0 ? raw.slice(0, cut) : raw;
+    var cmPart = cut >= 0 ? raw.slice(cut) : '';
+    /* 표시만 심어 두고 마지막에 태그로 바꾼다 — 방금 만든 태그를 다시 매칭하지 않도록 */
+    var s = codePart
+      .replace(/(@[A-Za-z]\w*)/g, '\u0001an\u0002$1\u0003')
+      .replace(KW, '\u0001k\u0002$1\u0003')
+      .replace(/\b(\d+)\b/g, '\u0001nu\u0002$1\u0003');
+    s = esc(s).replace(/\u0001(\w+)\u0002/g, '<span class="$1">').replace(/\u0003/g, '</span>');
+    if (cmPart) s += '<span class="cm">' + esc(cmPart) + '</span>';
+    return s;
+  }
+
+  function buildSlots() {
+    slotsEl.innerHTML = '';
+    slotNodes = [];
+    for (var i = 0; i < POOL; i++) {
+      var d = document.createElement('div');
+      d.className = 'slot';
+      d.innerHTML = '<div class="fill"></div><span class="sl">#' + (i + 1) +
+        '</span><span class="held"></span>';
+      slotsEl.appendChild(d);
+      slotNodes.push({ el: d, fill: d.querySelector('.fill'), held: d.querySelector('.held') });
+    }
+  }
+
+  function buildChips() {
+    chipsEl.innerHTML = '';
+    chipNodes = [];
+    var no = 0;
+    sc.phases.forEach(function (p) {
+      var isApi = p.k === 'api';
+      if (!isApi) no++;
+      var d = document.createElement('div');
+      d.className = 'ev';
+      d.setAttribute('data-k', p.k);
+      d.innerHTML = '<span class="st">' + (isApi ? '외부' : no) + '</span>' +
+        '<span class="nm">' + esc(p.n) + '</span>' +
+        '<span class="ms">' + (p.ms >= 1000 ? n(p.ms) + ' ms' : p.ms + ' ms') + '</span>';
+      chipsEl.appendChild(d);
+      chipNodes.push({ p: p, el: d });
+    });
+    /* 커넥션을 쥐고 있는 구간에 괄호를 친다 */
+    requestAnimationFrame(function () {
+      var first = null, lastN = null;
+      chipNodes.forEach(function (c) { if (c.p.hold) { if (!first) first = c.el; lastN = c.el; } });
+      holdbarEl.innerHTML = '';
+      if (!first) return;
+      var x0 = first.offsetLeft, x1 = lastN.offsetLeft + lastN.offsetWidth;
+      var span = document.createElement('div');
+      span.className = 'holdspan';
+      span.style.left = x0 + 'px';
+      span.style.width = (x1 - x0) + 'px';
+      var lab = document.createElement('div');
+      lab.className = 'holdlab';
+      lab.style.left = x0 + 'px';
+      lab.textContent = '커넥션 점유 ' + n(sc.sim.hold) + ' ms';
+      holdbarEl.appendChild(span);
+      holdbarEl.appendChild(lab);
+      holdbarEl.style.width = x1 + 'px';
+    });
+  }
+
+  function buildCmp() {
+    cmpEl.innerHTML = SC.map(function (s) {
+      var w = Math.max(0.6, s.sim.hold / MAXHOLD * 100);
+      return '<div class="cmprow' + (s.id === sc.id ? ' cur' : '') + '"' +
+        (s.bad ? ' data-hot="1"' : '') + '>' +
+        '<span class="cl2">' + s.no + ' ' + esc(s.short) + '</span>' +
+        '<span class="bar"><i style="width:' + w.toFixed(2) + '%"></i></span>' +
+        '<span class="val">' + n(s.sim.hold) + ' ms</span></div>';
+    }).join('');
+  }
+
+  function buildCode() {
+    codeEl.innerHTML = sc.code.map(function (line, i) {
+      return '<div class="cl" data-ln="' + (i + 1) + '"><span class="ln">' + (i + 1) +
+        '</span><span class="src">' + (line === '' ? ' ' : hlCode(line)) + '</span></div>';
+    }).join('');
+  }
+
+  function paint() {
+    var st = stateAt(sc, now), sim = sc.sim;
+
+    slotNodes.forEach(function (s, i) {
+      var r = st.occ[i];
+      if (!r) {
+        s.el.setAttribute('data-on', '0'); s.el.setAttribute('data-hot', '0');
+        s.fill.style.opacity = 0; s.held.textContent = '';
+        return;
+      }
+      var heldFor = now - r.acquire;
+      var hot = heldFor > 400;
+      s.el.setAttribute('data-on', '1');
+      s.el.setAttribute('data-hot', hot ? '1' : '0');
+      s.fill.style.opacity = (0.45 + Math.min(heldFor / 2000, 1) * 0.55).toFixed(3);
+      s.held.textContent = n(heldFor) + 'ms';
+    });
+
+    var qmax = 30;
+    qnum.textContent = st.q;
+    qnum.className = 'qnum' + (st.q > 0 ? ' bad' : '');
+    qtrack.className = 'qtrack' + (st.q > 0 ? ' bad' : '');
+    qtrack.firstElementChild.style.width = Math.min(st.q / qmax * 100, 100) + '%';
+    var dots = Math.min(st.q, 30), h = '';
+    for (var i = 0; i < dots; i++) h += '<s></s>';
+    qdots.innerHTML = h;
+    qnote.textContent = st.q > 0
+      ? '커넥션이 나기를 기다리는 중 — DB가 느린 게 아닙니다'
+      : (st.served >= REQS ? '40건 모두 처리 완료' : '풀이 비어 있으면 요청은 기다리지 않습니다');
+
+    var occN = st.occ.filter(Boolean).length;
+    cOcc.innerHTML = occN + '<small> / ' + POOL + '</small>';
+    cOcc.className = 'v' + (occN >= POOL ? ' bad' : '');
+    sOcc.textContent = occN >= POOL ? '가득 참 — 더는 못 빌린다' : '풀에서 빌려 간 수';
+    cQ.textContent = st.q;
+    cQ.className = 'v' + (st.q > 0 ? ' bad' : '');
+    sQ.textContent = st.q > 0 ? '이만큼이 줄을 서 있다' : '커넥션을 못 받고 줄 선 요청';
+    cW.innerHTML = n(st.maxWait) + '<small> ms</small>';
+    cW.className = 'v' + (st.maxWait > 500 ? ' bad' : '');
+    sW.textContent = st.served + ' / ' + REQS + '건 처리됨';
+    clockEl.textContent = n(now) + ' ms';
+
+    var live = null;
+    sim.tl.forEach(function (e) { if (now >= e.t0 && now < e.t1) live = e; });
+    chipNodes.forEach(function (c) { c.el.classList.toggle('live', !!live && live.p === c.p); });
+    Array.prototype.forEach.call(codeEl.children, function (row) {
+      var ln = +row.getAttribute('data-ln');
+      var on = !!live && live.p.ln === ln;
+      row.className = 'cl' + (on ? (live.p.k === 'api' ? ' act-hot' : ' act') : '');
+    });
+
+    if (now >= sim.span - 0.5) {
+      verdictEl.setAttribute('data-v', sc.verdict.v);
+      vtext.textContent = sc.verdict.t;
+      var maxQ = 0, maxW = 0;
+      sim.reqs.forEach(function (r) { if (r.wait > maxW) maxW = r.wait; });
+      sim.bounds.forEach(function (t) { var s2 = stateAt(sc, t); if (s2.q > maxQ) maxQ = s2.q; });
+      vmetrics.innerHTML = ['최대 큐 ' + maxQ, '최대 대기 ' + n(maxW) + ' ms', '전체 ' + n(sim.span - 400) + ' ms']
+        .map(function (m) { return '<span>' + m + '</span>'; }).join('');
+      recordRun(maxQ, maxW);
+    } else {
+      verdictEl.setAttribute('data-v', 'idle');
+      vtext.textContent = now === 0 ? '재생 버튼을 누르세요' : '재생 중…';
+      vmetrics.innerHTML = '';
+    }
+  }
+
+  function recordRun(maxQ, maxW) {
+    done[sc.id] = { no: sc.no, nm: sc.nm, hold: sc.sim.hold, q: maxQ, w: maxW,
+                    total: sc.sim.span - 400, bad: sc.bad };
+    var rows = SC.filter(function (s) { return done[s.id]; });
+    if (!rows.length) return;
+    prevBody.innerHTML = '<table><thead><tr><th>시나리오</th><th>커넥션 점유</th><th>최대 큐</th><th>최대 대기</th><th>전체 소요</th></tr></thead><tbody>' +
+      rows.map(function (s) {
+        var d = done[s.id];
+        return '<tr><td class="nm">' + d.no + ' ' + esc(d.nm) + '</td>' +
+          '<td class="mono' + (d.bad ? ' bad' : '') + '">' + n(d.hold) + ' ms</td>' +
+          '<td class="mono' + (d.q > 0 ? ' bad' : '') + '">' + d.q + '</td>' +
+          '<td class="mono' + (d.w > 500 ? ' bad' : '') + '">' + n(d.w) + ' ms</td>' +
+          '<td class="mono">' + n(d.total) + ' ms</td></tr>';
+      }).join('') + '</tbody></table>';
+  }
+
+  /* ---------- transport ---------- */
+  function rate() { return sc.sim.span / 7500; }   /* 어느 시나리오든 1x 에서 7.5초쯤에 끝난다 */
+  function loop(ts) {
+    if (!playing) return;
+    if (!last) last = ts;
+    var dt = Math.min(ts - last, 60); last = ts;
+    now += dt * rate() * speed;
+    if (now >= sc.sim.span) { now = sc.sim.span; playing = false; playBtn.textContent = '▶ 다시 재생'; }
+    paint();
+    if (playing) raf = requestAnimationFrame(loop);
+  }
+  function play() {
+    if (now >= sc.sim.span) now = 0;
+    playing = true; last = 0; playBtn.textContent = '❚❚ 일시정지';
+    raf = requestAnimationFrame(loop);
+  }
+  function pause() { playing = false; cancelAnimationFrame(raf); playBtn.textContent = '▶ 재생'; }
+
+  playBtn.addEventListener('click', function () { if (playing) { pause(); } else { play(); } });
+  stepBtn.addEventListener('click', function () {
+    pause();
+    var b = sc.sim.bounds;
+    for (var i = 0; i < b.length; i++) { if (b[i] > now + 0.5) { now = b[i]; break; } }
+    if (now >= sc.sim.span) { now = sc.sim.span; playBtn.textContent = '▶ 다시 재생'; }
+    paint();
+  });
+  resetBtn.addEventListener('click', function () { pause(); now = 0; paint(); });
+  Array.prototype.forEach.call(document.querySelectorAll('.spd'), function (b) {
+    b.addEventListener('click', function () {
+      speed = +b.getAttribute('data-s');
+      Array.prototype.forEach.call(document.querySelectorAll('.spd'), function (x) {
+        x.setAttribute('aria-pressed', x === b ? 'true' : 'false');
+      });
+    });
+  });
+
+  /* ---------- MVCC ---------- */
+  var mv;
+  function mvInit() { mv = { txid: 800, rows: [{ stock: 1, xmin: 800, xmax: null }] }; }
+  function mvPaint() {
+    $('mvrows').innerHTML = mv.rows.map(function (r) {
+      var dead = r.xmax !== null;
+      return '<div class="mvrow ' + (dead ? 'dead' : 'live') + '">' +
+        '<span>id=<b>1</b> · stock=<b>' + r.stock + '</b> · xmin=' + r.xmin +
+        (dead ? ' · xmax=' + r.xmax : '') + '</span>' +
+        '<s class="badge">' + (dead ? '죽은 버전' : '살아 있음') + '</s></div>';
+    }).join('');
+  }
+  $('mvUpdate').addEventListener('click', function () {
+    var liveRow = null;
+    mv.rows.forEach(function (r) { if (r.xmax === null) liveRow = r; });
+    if (!liveRow) return;
+    mv.txid++;
+    liveRow.xmax = mv.txid;
+    mv.rows.push({ stock: Math.max(0, liveRow.stock - 1), xmin: mv.txid, xmax: null });
+    mvPaint();
+  });
+  $('mvVacuum').addEventListener('click', function () {
+    mv.rows = mv.rows.filter(function (r) { return r.xmax === null; });
+    mvPaint();
+  });
+  $('mvReset').addEventListener('click', function () { mvInit(); mvPaint(); });
+
+  /* ---------- 시나리오 전환 ---------- */
+  function load(i) {
+    sc = SC[i];
+    pause(); now = 0;
+    $('anaTitle').textContent = sc.title;
+    buildChips(); buildCmp(); buildCode(); paint();
+    Array.prototype.forEach.call(picker.children, function (b, j) {
+      b.setAttribute('aria-pressed', j === i ? 'true' : 'false');
+    });
+  }
+
+  picker.innerHTML = SC.map(function (s, i) {
+    return '<button class="pick" type="button" aria-pressed="' + (i === 0 ? 'true' : 'false') + '"' +
+      (s.bad ? ' data-bad="1"' : '') + ' data-i="' + i + '">' +
+      '<span class="no">' + s.no + '</span><span class="nm">' + esc(s.nm) + '</span>' +
+      '<span class="tag">' + esc(s.tag) + '</span></button>';
+  }).join('');
+  Array.prototype.forEach.call(picker.children, function (b) {
+    b.addEventListener('click', function () { load(+b.getAttribute('data-i')); });
+  });
+
+  var rz;
+  window.addEventListener('resize', function () {
+    clearTimeout(rz); rz = setTimeout(function () { buildChips(); }, 120);
+  });
+  if (document.fonts) { document.fonts.ready.then(function () { buildChips(); }); }
+
+  buildSlots(); mvInit(); mvPaint(); load(0);
+})();
+</script>
+</body>
+</html>
