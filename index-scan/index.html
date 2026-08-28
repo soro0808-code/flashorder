@@ -1,0 +1,821 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1000만 행, 스물세 블록</title>
+<meta name="description" content="같은 쿼리가 93,557블록을 읽다가 23블록만 읽게 되는 과정을, 블록 격자에 불이 켜지는 것으로 재생해 보는 페이지.">
+<meta name="author" content="DuckVeloper">
+<meta property="og:type" content="website">
+<meta property="og:title" content="1000만 행, 스물세 블록">
+<meta property="og:description" content="PostgreSQL 17.11 · orders 1,000만 행에서 실제로 잰 EXPLAIN (ANALYZE, BUFFERS) 값을 격자 애니메이션으로 재생한다.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%97%82%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=swap">
+<style>
+:root{
+  --ground:#eceff0; --paper:#f7f9f9; --sunk:#e2e7e7;
+  --ink:#0f1e1d; --ink2:#52625f; --ink3:#7b8a87;
+  --rule:#ccd7d5; --rule2:#dde5e4;
+  --a:#0d6f6b; --a-soft:#d6eae9; --a-line:#0d6f6b;
+  --b:#b04617; --b-soft:#f7e3d7; --b-line:#b04617;
+  --lock:#6a4fa3; --lock-soft:#e7e1f4;
+  --alarm:#bd1130; --alarm-soft:#f9dde1;
+  --ok:#1c6b45;
+  --cell:#d3dbda;
+  --shadow:0 1px 2px rgba(15,30,29,.06), 0 8px 24px -18px rgba(15,30,29,.35);
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --sans:"IBM Plex Sans KR","IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic",sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0b1211; --paper:#131d1c; --sunk:#0e1716;
+    --ink:#e2ecea; --ink2:#8ba09d; --ink3:#6b807d;
+    --rule:#273836; --rule2:#1d2b2a;
+    --a:#46d2cb; --a-soft:#123230; --a-line:#46d2cb;
+    --b:#ff9455; --b-soft:#33200f; --b-line:#ff9455;
+    --lock:#ab8df2; --lock-soft:#241d3a;
+    --alarm:#ff5f72; --alarm-soft:#391219;
+    --ok:#57c48b;
+    --cell:#22302e;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -20px rgba(0,0,0,.9);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0b1211; --paper:#131d1c; --sunk:#0e1716;
+  --ink:#e2ecea; --ink2:#8ba09d; --ink3:#6b807d;
+  --rule:#273836; --rule2:#1d2b2a;
+  --a:#46d2cb; --a-soft:#123230; --a-line:#46d2cb;
+  --b:#ff9455; --b-soft:#33200f; --b-line:#ff9455;
+  --lock:#ab8df2; --lock-soft:#241d3a;
+  --alarm:#ff5f72; --alarm-soft:#391219;
+  --ok:#57c48b;
+  --cell:#22302e;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -20px rgba(0,0,0,.9);
+}
+
+*{box-sizing:border-box; margin:0; padding:0}
+html{-webkit-text-size-adjust:100%}
+body{
+  background:var(--ground); color:var(--ink);
+  font-family:var(--sans); font-size:16px; line-height:1.68;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px; margin:0 auto; padding:clamp(28px,5vw,64px) clamp(16px,4vw,32px) 80px}
+h1,h2,h3{text-wrap:balance}
+:focus-visible{outline:2px solid var(--a); outline-offset:2px; border-radius:3px}
+
+.eyebrow{
+  font-family:var(--mono); font-size:11.5px; font-weight:500;
+  letter-spacing:.16em; text-transform:uppercase; color:var(--ink3);
+}
+h1{
+  font-size:clamp(34px,6.4vw,58px); font-weight:700; letter-spacing:-.035em;
+  line-height:1.06; margin:14px 0 0;
+}
+.lede{margin:20px 0 0; max-width:62ch; font-size:clamp(15px,1.6vw,17px); color:var(--ink2)}
+.lede b{color:var(--ink); font-weight:600}
+.q{
+  margin:18px 0 0; padding:12px 14px; background:var(--sunk);
+  border:1px solid var(--rule); border-radius:3px; overflow-x:auto;
+}
+.q pre{font-family:var(--mono); font-size:12.5px; color:var(--ink2); white-space:pre}
+.rig{
+  display:flex; flex-wrap:wrap; gap:8px 18px; margin:24px 0 0;
+  padding-top:16px; border-top:1px solid var(--rule);
+  font-family:var(--mono); font-size:12px; color:var(--ink3);
+}
+.rig span b{color:var(--ink2); font-weight:500}
+
+.track{margin:44px 0 0}
+.track-head{display:flex; align-items:baseline; justify-content:space-between; gap:16px; margin-bottom:12px}
+@media (max-width:620px){ .track-head .eyebrow+.eyebrow{display:none} }
+.picker{display:grid; grid-template-columns:repeat(4,1fr); gap:8px}
+.picker>*{min-width:0}
+@media (max-width:760px){ .picker{grid-template-columns:repeat(2,1fr)} }
+.pick{
+  appearance:none; text-align:left; cursor:pointer;
+  background:var(--paper); color:var(--ink);
+  border:1px solid var(--rule); border-radius:2px;
+  padding:11px 12px 12px; display:flex; flex-direction:column; gap:5px;
+  font-family:inherit; transition:border-color .15s, background .15s;
+}
+.pick:hover{border-color:var(--ink3)}
+.pick .no{font-family:var(--mono); font-size:10.5px; letter-spacing:.14em; color:var(--ink3); text-transform:uppercase}
+.pick .nm{font-size:14px; font-weight:600; letter-spacing:-.01em; line-height:1.3}
+.pick .tag{font-family:var(--mono); font-size:11px; color:var(--ink3)}
+.pick[aria-pressed="true"]{background:var(--ink); color:var(--ground); border-color:var(--ink)}
+.pick[aria-pressed="true"] .no,.pick[aria-pressed="true"] .tag{color:var(--ground); opacity:.62}
+.pick[data-bad="1"] .tag{color:var(--alarm)}
+.pick[aria-pressed="true"][data-bad="1"] .tag{color:var(--ground); opacity:.75}
+
+.panel{background:var(--paper); border:1px solid var(--rule); border-radius:3px; box-shadow:var(--shadow); margin-top:14px}
+.panel-bar{display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:11px 14px; border-bottom:1px solid var(--rule2)}
+.panel-title{font-family:var(--mono); font-size:11.5px; letter-spacing:.13em; text-transform:uppercase; color:var(--ink3)}
+.legend{display:flex; gap:14px; margin-left:auto; flex-wrap:wrap}
+.lg{display:flex; align-items:center; gap:6px; font-family:var(--mono); font-size:11px; color:var(--ink2)}
+.lg i{width:14px; height:9px; border-radius:1px; display:block; border:1px solid transparent}
+.lg.idx i{background:var(--a)} .lg.hp i{background:var(--b)} .lg.no i{background:var(--cell)}
+
+.gridwrap{overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; padding:14px}
+#grid{display:block}
+.transport{display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:11px 14px; border-top:1px solid var(--rule2)}
+.btn{
+  appearance:none; cursor:pointer; font-family:var(--mono); font-size:12px; font-weight:500;
+  letter-spacing:.03em; color:var(--ink); background:var(--ground);
+  border:1px solid var(--rule); border-radius:2px; padding:7px 13px;
+  transition:background .14s,border-color .14s,color .14s;
+}
+.btn:hover{border-color:var(--ink3)}
+.btn.primary{background:var(--ink); color:var(--ground); border-color:var(--ink); min-width:104px}
+.btn.primary:hover{opacity:.88}
+.note{margin-left:auto; font-family:var(--mono); font-size:11px; color:var(--ink3)}
+@media (max-width:620px){ .note{margin-left:0; flex-basis:100%} }
+
+.readout{display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px}
+.readout>*{min-width:0}
+@media (max-width:760px){ .readout{grid-template-columns:1fr} }
+.rowcard{background:var(--paper); border:1px solid var(--rule); border-radius:3px; padding:13px 14px; box-shadow:var(--shadow)}
+.rowcard h3{
+  font-family:var(--mono); font-size:11px; letter-spacing:.13em; text-transform:uppercase;
+  color:var(--ink3); font-weight:500; margin-bottom:10px;
+}
+.fields{display:flex; flex-wrap:wrap; gap:8px 26px}
+.f{display:flex; flex-direction:column; gap:1px}
+.f .k{font-family:var(--mono); font-size:10.5px; color:var(--ink3)}
+.f .v{
+  font-family:var(--mono); font-size:26px; font-weight:600; line-height:1.15;
+  font-variant-numeric:tabular-nums; letter-spacing:-.02em;
+}
+.f .v.idx{color:var(--a)} .f .v.hp{color:var(--b)}
+
+.verdict{
+  grid-column:1/-1; display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+  padding:13px 16px; background:var(--paper);
+  border:1px solid var(--rule); border-left:3px solid var(--rule); border-radius:3px;
+  box-shadow:var(--shadow);
+}
+.verdict[data-v="bad"]{border-left-color:var(--alarm); background:var(--alarm-soft)}
+.verdict[data-v="ok"]{border-left-color:var(--ok)}
+.verdict[data-v="idle"]{opacity:.6}
+.verdict .vl{font-family:var(--mono); font-size:11px; letter-spacing:.13em; text-transform:uppercase; color:var(--ink3)}
+.verdict .vt{font-size:15px; font-weight:600; letter-spacing:-.01em}
+.verdict[data-v="bad"] .vt{color:var(--alarm)}
+.verdict[data-v="ok"] .vt{color:var(--ok)}
+.verdict .vm{margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--ink2); display:flex; gap:16px; flex-wrap:wrap}
+
+pre.plan{
+  margin:0; overflow-x:auto; font-family:var(--mono); font-size:12.5px; line-height:1.74;
+  padding:12px 0 14px;
+}
+.pl{display:flex; padding:0 14px 0 0; border-left:3px solid transparent; transition:background .14s}
+.pl .mk{flex:0 0 20px; font-size:10.5px; font-weight:600; text-align:center; opacity:0; color:var(--a)}
+.pl .src{white-space:pre; color:var(--ink2)}
+.pl.node .src{color:var(--ink)}
+.pl.act{background:var(--a-soft); border-left-color:var(--a)}
+.pl.act .mk{opacity:1}
+.pl.act .src{color:var(--ink)}
+.pl.gone .src{color:var(--ink3); text-decoration:line-through; opacity:.75}
+.pl .hl{color:var(--a); font-weight:600}
+.pl .warn{color:var(--alarm); font-weight:600}
+
+.hero{
+  margin-top:10px; background:var(--paper); border:1px solid var(--rule); border-radius:3px;
+  box-shadow:var(--shadow); padding:20px 22px; display:flex; align-items:baseline;
+  gap:18px; flex-wrap:wrap;
+}
+.hero .big{
+  font-family:var(--mono); font-size:clamp(38px,7vw,64px); font-weight:600;
+  letter-spacing:-.04em; line-height:1; color:var(--a); font-variant-numeric:tabular-nums;
+}
+.hero .cap{color:var(--ink2); max-width:44ch}
+.hero .cap b{color:var(--ink); font-weight:600}
+
+section.prose{margin-top:64px}
+section.prose h2{
+  font-size:clamp(21px,2.8vw,27px); font-weight:700; letter-spacing:-.028em; line-height:1.25;
+  padding-top:20px; border-top:1px solid var(--rule);
+}
+section.prose p{margin:14px 0 0; max-width:66ch; color:var(--ink2)}
+section.prose p b{color:var(--ink); font-weight:600}
+.tblwrap{overflow-x:auto; margin-top:22px; border:1px solid var(--rule); border-radius:3px; background:var(--paper); box-shadow:var(--shadow)}
+table{border-collapse:collapse; width:100%; min-width:720px; font-size:13.5px}
+th,td{padding:11px 14px; text-align:left; border-bottom:1px solid var(--rule2); vertical-align:top}
+thead th{
+  font-family:var(--mono); font-size:10.5px; letter-spacing:.12em; text-transform:uppercase;
+  color:var(--ink3); font-weight:500; background:var(--sunk); white-space:nowrap;
+}
+tbody tr:last-child td{border-bottom:0}
+td.nm{font-weight:600; color:var(--ink); white-space:nowrap}
+td.mono{font-family:var(--mono); font-size:12.5px; font-variant-numeric:tabular-nums; white-space:nowrap}
+.bad{color:var(--alarm); font-weight:600} .good{color:var(--ok); font-weight:600}
+
+/* ---------- 쓰기 대가 ---------- */
+.wbar{padding:16px 18px 20px}
+.wrow{display:flex; align-items:center; gap:12px; margin-top:12px}
+.wrow .wl{
+  flex:0 0 118px; text-align:right; font-family:var(--mono); font-size:12px; color:var(--ink2);
+}
+@media (max-width:560px){ .wrow{flex-wrap:wrap} .wrow .wl{flex:1 1 100%; text-align:left} }
+.wtrack{flex:1 1 auto; min-width:0; height:26px; background:var(--sunk); border-radius:2px; position:relative; overflow:hidden}
+.wfill{
+  position:absolute; left:0; top:0; bottom:0; border-radius:2px; min-width:4px;
+  transition:width .6s cubic-bezier(.22,.8,.3,1); background:var(--a);
+}
+.wfill[data-s="many"]{background:var(--alarm)}
+.wspan{
+  position:absolute; top:0; bottom:0; border-radius:2px; opacity:.45; min-width:4px;
+  transition:left .6s cubic-bezier(.22,.8,.3,1), width .6s cubic-bezier(.22,.8,.3,1);
+  background:var(--alarm);
+}
+.wval{
+  flex:0 0 120px; font-family:var(--mono); font-size:13px; font-variant-numeric:tabular-nums;
+  color:var(--ink); font-weight:600;
+}
+@media (max-width:560px){ .wval{flex:0 0 auto} }
+.sizes{display:flex; height:34px; margin-top:16px; border-radius:2px; overflow:hidden; border:1px solid var(--rule)}
+.sizes span{
+  display:flex; align-items:center; justify-content:center; overflow:hidden; white-space:nowrap;
+  font-family:var(--mono); font-size:10.5px; color:#fff;
+}
+.sizekey{display:flex; flex-wrap:wrap; gap:6px 16px; margin-top:10px; font-family:var(--mono); font-size:11px; color:var(--ink2)}
+.sizekey i{display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px}
+
+footer{
+  margin-top:72px; padding-top:22px; border-top:1px solid var(--rule);
+  display:flex; gap:18px; flex-wrap:wrap; align-items:baseline;
+  font-family:var(--mono); font-size:12px; color:var(--ink3);
+}
+footer a{color:var(--ink2); text-decoration:none; border-bottom:1px solid var(--rule)}
+footer a:hover{color:var(--ink); border-bottom-color:var(--ink3)}
+@media (prefers-reduced-motion:reduce){
+  .wfill,.wspan{transition:none}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">FlashOrder · 인덱스 재현기</div>
+    <h1>1000만 행, 스물세 블록</h1>
+    <p class="lede">
+      <b>orders</b> 테이블에 1,000만 행이 쌓였습니다. 아래 한 줄짜리 조회가 처음엔
+      <b>93,557개 블록</b>을 읽습니다. 인덱스를 제대로 걸고 나면 <b>23개</b>만 읽습니다.
+      같은 쿼리, 같은 데이터입니다. 재생을 눌러 격자에 불이 어떻게 켜지는지 보세요.
+    </p>
+    <div class="q"><pre>SELECT * FROM orders WHERE member_id = 100 ORDER BY created_at DESC LIMIT 20;</pre></div>
+    <div class="rig">
+      <span><b>PostgreSQL 17.11</b></span>
+      <span>orders <b>1,000만 행</b> · 힙 730 MB</span>
+      <span>EXPLAIN (ANALYZE, BUFFERS)</span>
+      <span>블록 1개 = <b>8 kB</b></span>
+    </div>
+  </header>
+
+  <div class="track">
+    <div class="track-head">
+      <div class="eyebrow">인덱스를 하나씩 얹어 본다</div>
+      <div class="eyebrow" style="color:var(--ink2)">01은 인덱스가 없는 상태, 04까지 가면 힙을 아예 안 읽는다</div>
+    </div>
+    <div class="picker" id="picker" role="group" aria-label="시나리오 선택"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-bar">
+      <span class="panel-title" id="scName">인덱스 없음</span>
+      <div class="legend">
+        <span class="lg idx"><i></i>인덱스 블록</span>
+        <span class="lg hp"><i></i>힙 블록</span>
+        <span class="lg no"><i></i>안 읽음</span>
+      </div>
+    </div>
+    <div class="gridwrap" id="gridwrap"><canvas id="grid"></canvas></div>
+    <div class="transport">
+      <button class="btn primary" id="play">▶ 재생</button>
+      <button class="btn" id="step">한 스텝 →</button>
+      <button class="btn" id="reset">↺ 처음으로</button>
+      <span class="note">격자 한 칸 = 블록 1개 · 애니메이션 속도는 실제 시간 비율이 아니다</span>
+    </div>
+  </div>
+
+  <div class="readout">
+    <div class="rowcard">
+      <h3>읽은 블록</h3>
+      <div class="fields">
+        <div class="f"><span class="k">인덱스</span><span class="v idx" id="nIdx">0</span></div>
+        <div class="f"><span class="k">힙(본체)</span><span class="v hp" id="nHeap">0</span></div>
+        <div class="f"><span class="k">합계</span><span class="v" id="nAll">0</span></div>
+      </div>
+    </div>
+    <div class="rowcard">
+      <h3>실측 실행 시간</h3>
+      <div class="fields">
+        <div class="f"><span class="k">Execution Time</span><span class="v" id="nMs">0.000 ms</span></div>
+        <div class="f"><span class="k">읽은 양</span><span class="v" id="nKb">0 kB</span></div>
+      </div>
+    </div>
+    <div class="verdict" id="verdict" data-v="idle">
+      <span class="vl">판정</span>
+      <span class="vt" id="vtext">재생 버튼을 누르세요</span>
+      <span class="vm" id="vmetrics"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-bar"><span class="panel-title">실행계획 — 지금 실행 중인 노드가 켜진다</span></div>
+    <pre class="plan" id="plan"></pre>
+  </div>
+
+  <div class="hero">
+    <span class="big" id="heroBig">3,330×</span>
+    <span class="cap" id="heroCap">
+      인덱스 없이 <b>279.680 ms</b>였던 같은 쿼리가, 복합 인덱스 하나로 <b>0.084 ms</b>가 됩니다.
+      읽는 블록이 93,557개에서 23개로 줄었기 때문입니다.
+    </span>
+  </div>
+
+  <section class="prose">
+    <h2>읽는 양을 줄인 대가는 쓰기에서 낸다</h2>
+    <p>
+      위에서 본 인덱스 세 개를 그대로 얹어 둔 채 <b>같은 10만 건을 INSERT</b> 해봤습니다.
+      인덱스는 조회에만 쓰이는 게 아니라, 행이 하나 들어올 때마다 <b>전부 같이 갱신됩니다.</b>
+      아래 버튼으로 인덱스를 붙였다 뗐다 해보세요.
+    </p>
+    <div class="panel">
+      <div class="panel-bar">
+        <span class="panel-title">10만 건 INSERT · 세 번 반복</span>
+        <span style="margin-left:auto; display:flex; gap:8px">
+          <button class="btn" id="wNone" aria-pressed="true">보조 인덱스 0개</button>
+          <button class="btn" id="wMany" aria-pressed="false">보조 인덱스 3개</button>
+        </span>
+      </div>
+      <div class="wbar">
+        <div class="wrow"><span class="wl">1회차</span><span class="wtrack"><span class="wfill" id="w1"></span></span><span class="wval" id="v1">94 ms</span></div>
+        <div class="wrow"><span class="wl">2회차</span><span class="wtrack"><span class="wfill" id="w2"></span></span><span class="wval" id="v2">104 ms</span></div>
+        <div class="wrow"><span class="wl">3회차</span><span class="wtrack"><span class="wfill" id="w3"></span></span><span class="wval" id="v3">112 ms</span></div>
+        <div class="wrow" style="margin-top:16px; padding-top:14px; border-top:1px solid var(--rule2)">
+          <span class="wl">실행 편차</span>
+          <span class="wtrack"><span class="wspan" id="wsp"></span></span>
+          <span class="wval" id="vsp">94 ~ 112 ms</span>
+        </div>
+      </div>
+    </div>
+    <p id="wNote">
+      인덱스가 없을 때는 <b>94~112 ms</b>로 거의 흔들리지 않습니다. 매번 비슷하게 끝납니다.
+    </p>
+
+    <h2>인덱스가 본체보다 커졌다</h2>
+    <p>
+      네 개를 다 만든 뒤 크기를 재봤습니다. 힙(테이블 본체)이 730 MB인데,
+      인덱스를 다 합치면 <b>1,056 MB</b>입니다. 디스크에 올려 둔 것의 절반 이상이 인덱스입니다.
+    </p>
+    <div class="sizes" id="sizes"></div>
+    <div class="sizekey" id="sizekey"></div>
+    <p>
+      커버링 인덱스 하나가 473 MB로 가장 큽니다. <code style="font-family:var(--mono);font-size:.9em">INCLUDE</code>로
+      붙인 컬럼이 인덱스 리프에 그대로 복사되기 때문입니다. 힙을 아예 안 읽는 대신
+      <b>테이블의 일부를 인덱스에 한 번 더 저장한 것</b>입니다.
+    </p>
+
+    <h2>그래서 어디까지 거는가</h2>
+    <div class="tblwrap">
+      <table>
+        <thead><tr><th>단계</th><th>실행계획</th><th>읽은 블록</th><th>실행 시간</th><th>얻은 것 / 낸 값</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="nm">인덱스 없음</td><td>Parallel Seq Scan → Sort</td>
+            <td class="mono bad">93,557</td><td class="mono bad">279.680 ms</td>
+            <td>쓰기는 가장 빠르다. 조회가 감당이 안 될 뿐</td>
+          </tr>
+          <tr>
+            <td class="nm">(member_id)</td><td>Bitmap Index Scan → Bitmap Heap Scan → Sort</td>
+            <td class="mono">98</td><td class="mono">0.586 ms</td>
+            <td>대부분 여기서 끝내도 된다. 정렬은 아직 남아 있다</td>
+          </tr>
+          <tr>
+            <td class="nm">(member_id, created_at DESC)</td><td>Index Scan <span class="good">— Sort 없음</span></td>
+            <td class="mono good">23</td><td class="mono good">0.084 ms</td>
+            <td>정렬까지 인덱스가 해결한다. 실무에서 가장 자주 옳은 답</td>
+          </tr>
+          <tr>
+            <td class="nm">+ INCLUDE(status, amount)</td><td>Index Only Scan <span class="good">— Heap Fetches 0</span></td>
+            <td class="mono good">18</td><td class="mono good">0.080 ms</td>
+            <td>0.004 ms 벌자고 473 MB를 낸다. 대개 과하다</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      03에서 04로 가면서 줄어든 시간은 <b>0.004 ms</b>입니다. 그 대가로 473 MB짜리 인덱스가
+      하나 더 생기고, 그만큼 쓰기가 더 느려집니다. 인덱스를 하나 더 만들지 말지는
+      조회 이득이 아니라 <b>이 교환이 남는가</b>로 판단합니다.
+    </p>
+  </section>
+
+  <footer>
+    <span>FlashOrder — 시니어 백엔드 시리즈 부록</span>
+    <a href="https://seungwon08.tistory.com" target="_blank" rel="noopener">seungwon08.tistory.com</a>
+    <span style="margin-left:auto">PostgreSQL 17.11 · 2026-08-28 측정</span>
+  </footer>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  var HEAP_TOTAL = 93557, COLS = 620, ROWS = Math.ceil(HEAP_TOTAL / COLS);
+  var IDX_COLS = 64;
+
+  /* 흩어진 힙 블록 위치 — 재현 가능한 난수 */
+  function scatter(n, seed) {
+    var s = seed, out = [], seen = {};
+    while (out.length < n) {
+      s = (s * 1664525 + 1013904223) % 4294967296;
+      var v = Math.floor((s / 4294967296) * HEAP_TOTAL);
+      if (!seen[v]) { seen[v] = 1; out.push(v); }
+    }
+    return out.sort(function (a, b) { return a - b; });
+  }
+
+  var SC = [
+    {
+      no: '01', nm: '인덱스 없음', tag: '93,557 블록', bad: true,
+      title: '인덱스 없음 — Parallel Seq Scan',
+      idx: 0, heap: HEAP_TOTAL, ms: 279.680, seq: true, dur: 3600,
+      phases: [
+        { n: 3, idx: 0, heap: HEAP_TOTAL, d: .74 },
+        { n: 2, idx: 0, heap: 0, d: .14 },
+        { n: 1, idx: 0, heap: 0, d: .06 },
+        { n: 0, idx: 0, heap: 0, d: .06 }
+      ],
+      plan: [
+        { n: 0, t: 'Limit  (actual rows=20 loops=1)', node: 1 },
+        { n: 0, t: '  Buffers: shared hit=13044 read=80513', warn: 1 },
+        { n: 1, t: '  -> Gather Merge  (actual rows=20 loops=1)', node: 1 },
+        { n: 1, t: '       Workers Launched: 2' },
+        { n: 2, t: '       -> Sort  (actual rows=16 loops=3)', node: 1 },
+        { n: 2, t: '            Sort Key: created_at DESC' },
+        { n: 2, t: '            Sort Method: quicksort  Memory: 27kB' },
+        { n: 3, t: '            -> Parallel Seq Scan on orders  (actual rows=31 loops=3)', node: 1 },
+        { n: 3, t: '                 Filter: (member_id = 100)' },
+        { n: 3, t: '                 Rows Removed by Filter: 3333319', warn: 1 },
+        { t: '' },
+        { t: 'Execution Time: 279.680 ms', warn: 1 }
+      ],
+      hero: '93,557', heroCap: '92건을 찾으려고 테이블 <b>731 MB</b>를 통째로 읽습니다. 복합 인덱스를 걸면 이게 <b>23개 블록</b>이 됩니다 — 3,330배입니다.',
+      verdict: { v: 'bad', t: '92건을 찾으려고 테이블 전체를 훑었습니다' },
+      metrics: ['93,557 블록 · 731 MB', '걸러서 버린 행 3,333,319 × 3 워커']
+    },
+    {
+      no: '02', nm: '(member_id)', tag: '98 블록', bad: false,
+      title: '단일 인덱스 — Bitmap Index Scan → Bitmap Heap Scan',
+      idx: 6, heap: 92, ms: 0.586, dur: 2400,
+      phases: [
+        { n: 4, idx: 6, heap: 0, d: .26 },
+        { n: 3, idx: 0, heap: 92, d: .36 },
+        { n: 2, idx: 0, heap: 0, d: .22 },
+        { n: 0, idx: 0, heap: 0, d: .16 }
+      ],
+      plan: [
+        { n: 0, t: 'Limit  (actual rows=20 loops=1)', node: 1 },
+        { n: 0, t: '  Buffers: shared hit=17 read=81' },
+        { n: 2, t: '  -> Sort  (actual rows=20 loops=1)', node: 1 },
+        { n: 2, t: '       Sort Key: created_at DESC' },
+        { n: 2, t: '       Sort Method: top-N heapsort  Memory: 27kB' },
+        { n: 3, t: '       -> Bitmap Heap Scan on orders  (actual rows=92 loops=1)', node: 1 },
+        { n: 3, t: '            Recheck Cond: (member_id = 100)' },
+        { n: 3, t: '            Heap Blocks: exact=92' },
+        { n: 4, t: '            -> Bitmap Index Scan on idx_orders_member  (actual rows=92)', node: 1 },
+        { n: 4, t: '                 Index Cond: (member_id = 100)' },
+        { n: 4, t: '                 Buffers: shared hit=3 read=3' },
+        { t: '' },
+        { t: 'Execution Time: 0.586 ms', hl: 1 }
+      ],
+      hero: '477×', heroCap: '인덱스가 <b>어디를 읽어야 하는지</b> 찍어 줍니다. 93,557블록이 98블록이 됐습니다. 다만 정렬은 아직 Sort 노드가 하고 있습니다.',
+      verdict: { v: 'ok', t: '인덱스가 읽을 자리를 찍어 줍니다 — 98블록' },
+      metrics: ['477배 빨라짐', 'Sort 노드는 아직 남아 있다']
+    },
+    {
+      no: '03', nm: '+ created_at DESC', tag: '23 블록', bad: false,
+      title: '복합 인덱스 — Index Scan, 정렬이 사라진다',
+      idx: 3, heap: 20, ms: 0.084, dur: 2200,
+      phases: [
+        { n: 1, idx: 3, heap: 20, d: .70 },
+        { n: 0, idx: 0, heap: 0, d: .30 }
+      ],
+      plan: [
+        { n: 0, t: 'Limit  (actual rows=20 loops=1)', node: 1 },
+        { n: 0, t: '  Buffers: shared hit=20 read=3' },
+        { gone: 1, t: '  -> Sort  (Sort Key: created_at DESC)      <- 통째로 사라졌다' },
+        { n: 1, t: '  -> Index Scan using idx_orders_member_created on orders  (actual rows=20)', node: 1 },
+        { n: 1, t: '       Index Cond: (member_id = 100)' },
+        { t: '' },
+        { t: 'Execution Time: 0.084 ms', hl: 1 }
+      ],
+      hero: '3,330×', heroCap: '인덱스가 이미 <b>created_at DESC 순서</b>라 정렬할 필요가 없습니다. Sort 노드가 실행계획에서 통째로 사라졌습니다.',
+      verdict: { v: 'ok', t: '정렬까지 인덱스가 해결했습니다 — 23블록' },
+      metrics: ['3,330배 빨라짐', 'Sort 노드가 사라졌다']
+    },
+    {
+      no: '04', nm: '+ INCLUDE', tag: '18 블록 · 힙 0', bad: false,
+      title: '커버링 인덱스 — Index Only Scan, 힙을 안 간다',
+      idx: 18, heap: 0, ms: 0.080, dur: 2200,
+      phases: [
+        { n: 1, idx: 18, heap: 0, d: .70 },
+        { n: 0, idx: 0, heap: 0, d: .30 }
+      ],
+      plan: [
+        { n: 0, t: 'Limit  (actual rows=20 loops=1)', node: 1 },
+        { n: 0, t: '  Buffers: shared hit=14 read=4' },
+        { n: 1, t: '  -> Index Only Scan using idx_orders_cover on orders  (actual rows=20)', node: 1 },
+        { n: 1, t: '       Index Cond: (member_id = 100)' },
+        { n: 1, t: '       Heap Fetches: 0', hl: 1 },
+        { t: '' },
+        { t: 'Execution Time: 0.080 ms', hl: 1 }
+      ],
+      hero: '3,496×', heroCap: '필요한 컬럼이 전부 인덱스 안에 있어서 <b>힙을 한 번도 열지 않습니다.</b> 아래 격자의 힙 영역이 끝까지 꺼져 있습니다.',
+      verdict: { v: 'ok', t: '힙을 한 번도 읽지 않았습니다 — Heap Fetches 0' },
+      metrics: ['3,496배 빨라짐', '대가: 인덱스 473 MB']
+    }
+  ];
+
+  SC.forEach(function (s, i) { s.pos = s.seq ? null : scatter(s.heap, 7919 + i * 131); });
+
+  /* ---------- canvas ---------- */
+  var cv = $('grid'), ctx = cv.getContext('2d');
+  var wrap = $('gridwrap');
+  var geo = { w: 620, cell: 1, ic: 10, yIdx: 0, yHeap: 0, h: 0 };
+  var C = {};
+
+  function readColors() {
+    var cs = getComputedStyle(document.documentElement);
+    ['a', 'b', 'cell', 'ink3', 'rule', 'paper', 'alarm'].forEach(function (k) {
+      C[k] = cs.getPropertyValue('--' + k).trim();
+    });
+  }
+
+  function layout() {
+    var avail = wrap.clientWidth - 28;
+    var w = Math.max(avail, 620);
+    var cell = w / COLS;
+    var ic = Math.max(8, Math.min(15, Math.floor(w / 78)));
+    var yIdx = 20, yHeap = yIdx + ic + 32;
+    var h = yHeap + ROWS * cell + 8;
+    geo = { w: w, cell: cell, ic: ic, yIdx: yIdx, yHeap: yHeap, h: h };
+    cv.style.width = w + 'px';
+    cv.style.height = h + 'px';
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function draw(sc, nIdx, nHeap) {
+    readColors();
+    var g = geo;
+    ctx.clearRect(0, 0, g.w, g.h);
+
+    ctx.font = '11px "IBM Plex Mono", monospace';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = C.ink3;
+    ctx.fillText('인덱스 블록 (확대)', 0, 13);
+    ctx.fillText('힙 블록 · 93,557개 = 731 MB · 한 칸이 8 kB 블록 하나', 0, g.yHeap - 10);
+
+    /* 인덱스 스트립 */
+    for (var i = 0; i < IDX_COLS; i++) {
+      ctx.fillStyle = i < nIdx ? C.a : C.cell;
+      ctx.fillRect(i * (g.ic + 2), g.yIdx, g.ic, g.ic);
+    }
+
+    /* 힙 격자 */
+    var hH = ROWS * g.cell;
+    ctx.fillStyle = C.cell;
+    ctx.fillRect(0, g.yHeap, g.w, hH);
+
+    ctx.fillStyle = C.b;
+    if (sc.seq) {
+      var full = Math.floor(nHeap / COLS), rem = nHeap % COLS;
+      if (full > 0) ctx.fillRect(0, g.yHeap, g.w, full * g.cell);
+      if (rem > 0) ctx.fillRect(0, g.yHeap + full * g.cell, rem * g.cell, g.cell);
+    } else if (nHeap > 0) {
+      var m = Math.max(g.cell, 4.5);
+      for (var j = 0; j < nHeap; j++) {
+        var p = sc.pos[j];
+        var cx = (p % COLS) * g.cell, cy = g.yHeap + Math.floor(p / COLS) * g.cell;
+        ctx.fillRect(cx - (m - g.cell) / 2, cy - (m - g.cell) / 2, m, m);
+      }
+    }
+
+    /* 방안지 결 — 색 덩어리가 아니라 블록 격자로 읽히게 한다 */
+    ctx.save();
+    ctx.globalAlpha = .34; ctx.strokeStyle = C.paper; ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (var gx = 62; gx < COLS; gx += 62) {
+      var px = Math.round(gx * g.cell) + .5;
+      ctx.moveTo(px, g.yHeap); ctx.lineTo(px, g.yHeap + hH);
+    }
+    for (var gy = 15; gy < ROWS; gy += 15) {
+      var py = Math.round(g.yHeap + gy * g.cell) + .5;
+      ctx.moveTo(0, py); ctx.lineTo(g.w, py);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    /* 순차 스캔 진행 선단 */
+    if (sc.seq && nHeap > 0 && nHeap < HEAP_TOTAL) {
+      var fr = Math.floor(nHeap / COLS), fc = nHeap % COLS;
+      ctx.fillStyle = C.alarm;
+      ctx.fillRect(0, g.yHeap + fr * g.cell, Math.max(fc * g.cell, 2), Math.max(g.cell, 2));
+    }
+
+    ctx.strokeStyle = C.rule; ctx.lineWidth = 1;
+    ctx.strokeRect(.5, g.yHeap + .5, g.w - 1, hH - 1);
+  }
+
+  /* ---------- 상태 ---------- */
+  var idx = 0, sc = SC[0], now = 0, playing = false, raf = 0, last = 0;
+
+  function counts(p) {
+    var ph = sc.phases, acc = 0, ci = 0, ch = 0;
+    for (var i = 0; i < ph.length; i++) {
+      var s = acc, e = acc + ph[i].d;
+      if (p >= e) { ci += ph[i].idx; ch += ph[i].heap; }
+      else if (p > s) {
+        var f = (p - s) / ph[i].d;
+        ci += Math.round(ph[i].idx * f); ch += Math.round(ph[i].heap * f);
+        break;
+      } else break;
+      acc = e;
+    }
+    return { i: ci, h: ch };
+  }
+  function activeNode(p) {
+    var ph = sc.phases, acc = 0;
+    for (var i = 0; i < ph.length; i++) {
+      acc += ph[i].d;
+      if (p < acc - 1e-9) return ph[i].n;
+    }
+    return ph[ph.length - 1].n;
+  }
+  var fmt = function (n) { return n.toLocaleString('en-US'); };
+  function kb(blocks) {
+    var k = blocks * 8;
+    if (k >= 1048576) return (k / 1048576).toFixed(2) + ' GB';
+    if (k >= 1024) return (k / 1024).toFixed(k / 1024 >= 100 ? 0 : 1) + ' MB';
+    return fmt(k) + ' kB';
+  }
+
+  function paint() {
+    var p = Math.min(now, 1);
+    var c = counts(p);
+    if (p >= 1) { c.i = sc.idx; c.h = sc.heap; }
+    draw(sc, c.i, c.h);
+
+    $('nIdx').textContent = fmt(c.i);
+    $('nHeap').textContent = fmt(c.h);
+    $('nAll').textContent = fmt(c.i + c.h);
+    $('nMs').textContent = (sc.ms * p).toFixed(3) + ' ms';
+    $('nKb').textContent = kb(c.i + c.h);
+
+    var an = p > 0 ? activeNode(p) : -1;
+    Array.prototype.forEach.call($('plan').children, function (el) {
+      var n = el.getAttribute('data-n');
+      var on = n !== null && n !== '' && Number(n) === an && p > 0 && p < 1;
+      el.classList.toggle('act', on);
+    });
+
+    var v = $('verdict');
+    if (p >= 1) {
+      v.setAttribute('data-v', sc.verdict.v);
+      $('vtext').textContent = sc.verdict.t;
+      $('vmetrics').innerHTML = sc.metrics.map(function (m) { return '<span>' + m + '</span>'; }).join('');
+    } else {
+      v.setAttribute('data-v', 'idle');
+      $('vtext').textContent = p === 0 ? '재생 버튼을 누르세요' : '읽는 중…';
+      $('vmetrics').innerHTML = '';
+    }
+  }
+
+  function loop(ts) {
+    if (!playing) return;
+    if (!last) last = ts;
+    var dt = Math.min(ts - last, 64); last = ts;
+    now += dt / sc.dur;
+    if (now >= 1) { now = 1; playing = false; $('play').textContent = '▶ 다시 재생'; }
+    paint();
+    if (playing) raf = requestAnimationFrame(loop);
+  }
+  function play() {
+    if (now >= 1) now = 0;
+    playing = true; last = 0; $('play').textContent = '❚❚ 일시정지';
+    raf = requestAnimationFrame(loop);
+  }
+  function pause() { playing = false; cancelAnimationFrame(raf); $('play').textContent = '▶ 재생'; }
+
+  $('play').addEventListener('click', function () { playing ? pause() : play(); });
+  $('reset').addEventListener('click', function () { pause(); now = 0; paint(); });
+  $('step').addEventListener('click', function () {
+    pause();
+    var acc = 0, target = 1;
+    for (var i = 0; i < sc.phases.length; i++) {
+      acc += sc.phases[i].d;
+      if (acc > now + 1e-6) { target = Math.min(acc, 1); break; }
+    }
+    now = target;
+    if (now >= 1) { now = 1; $('play').textContent = '▶ 다시 재생'; }
+    paint();
+  });
+
+  function load(i) {
+    idx = i; sc = SC[i]; pause(); now = 0;
+    $('scName').textContent = sc.title;
+    $('heroBig').textContent = sc.hero;
+    $('heroCap').innerHTML = sc.heroCap;
+    $('plan').innerHTML = sc.plan.map(function (l) {
+      var cls = 'pl' + (l.node ? ' node' : '') + (l.gone ? ' gone' : '');
+      var txt = (l.t || ' ').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      if (l.hl) txt = '<span class="hl">' + txt + '</span>';
+      if (l.warn) txt = '<span class="warn">' + txt + '</span>';
+      return '<div class="' + cls + '" data-n="' + (l.n === undefined ? '' : l.n) +
+        '"><span class="mk">▶</span><span class="src">' + txt + '</span></div>';
+    }).join('');
+    Array.prototype.forEach.call($('picker').children, function (b, j) {
+      b.setAttribute('aria-pressed', j === i ? 'true' : 'false');
+    });
+    layout(); paint();
+  }
+
+  $('picker').innerHTML = SC.map(function (s, i) {
+    return '<button class="pick" type="button" data-i="' + i + '"' + (s.bad ? ' data-bad="1"' : '') +
+      ' aria-pressed="' + (i === 0 ? 'true' : 'false') + '">' +
+      '<span class="no">' + s.no + '</span><span class="nm">' + s.nm + '</span>' +
+      '<span class="tag">' + s.tag + '</span></button>';
+  }).join('');
+  Array.prototype.forEach.call($('picker').children, function (b) {
+    b.addEventListener('click', function () { load(Number(b.getAttribute('data-i'))); });
+  });
+
+  /* ---------- 쓰기 대가 ---------- */
+  var W = {
+    none: { runs: [94, 104, 112], note: '인덱스가 없을 때는 <b>94~112 ms</b>로 거의 흔들리지 않습니다. 매번 비슷하게 끝납니다.' },
+    many: { runs: [4400, 6713, 13624], note: '보조 인덱스 3개를 얹으면 <b>4.4초에서 13.6초까지</b> 튑니다. 느려진 것도 문제지만, <b>실행마다 얼마나 걸릴지 모르게 된 것</b>이 더 문제입니다. 행이 들어올 때마다 인덱스 3개를 같이 고쳐야 하고, 페이지가 쪼개지는 시점이 매번 다르기 때문입니다.' }
+  };
+  var WMAX = 13624;
+  function setW(mode) {
+    var d = W[mode], r = d.runs;
+    [1, 2, 3].forEach(function (k) {
+      var el = $('w' + k);
+      el.style.width = (r[k - 1] / WMAX * 100) + '%';
+      el.setAttribute('data-s', mode);
+      $('v' + k).textContent = mode === 'none' ? r[k - 1] + ' ms'
+        : (r[k - 1] / 1000).toFixed(1) + ' s  (' + fmt(r[k - 1]) + ' ms)';
+    });
+    var lo = Math.min.apply(null, r), hi = Math.max.apply(null, r);
+    $('wsp').style.left = (lo / WMAX * 100) + '%';
+    $('wsp').style.width = ((hi - lo) / WMAX * 100) + '%';
+    $('vsp').textContent = mode === 'none' ? lo + ' ~ ' + hi + ' ms'
+      : (lo / 1000).toFixed(1) + ' ~ ' + (hi / 1000).toFixed(1) + ' s';
+    $('wNote').innerHTML = d.note;
+    $('wNone').setAttribute('aria-pressed', mode === 'none' ? 'true' : 'false');
+    $('wMany').setAttribute('aria-pressed', mode === 'many' ? 'true' : 'false');
+    $('wNone').style.background = mode === 'none' ? 'var(--sunk)' : '';
+    $('wMany').style.background = mode === 'many' ? 'var(--sunk)' : '';
+  }
+  $('wNone').addEventListener('click', function () { setW('none'); });
+  $('wMany').addEventListener('click', function () { setW('many'); });
+
+  /* ---------- 크기 막대 ---------- */
+  var SIZES = [
+    { n: '힙 (테이블 본체)', mb: 730, c: 'var(--ink3)' },
+    { n: 'orders_pkey', mb: 214, c: 'var(--lock)' },
+    { n: 'idx_member', mb: 68, c: 'var(--a)' },
+    { n: 'idx_member_created', mb: 301, c: 'var(--b)' },
+    { n: 'idx_cover (INCLUDE)', mb: 473, c: 'var(--alarm)' }
+  ];
+  var TOT = SIZES.reduce(function (a, s) { return a + s.mb; }, 0);
+  $('sizes').innerHTML = SIZES.map(function (s) {
+    var p = s.mb / TOT * 100;
+    return '<span style="flex:0 0 ' + p + '%;background:' + s.c + '">' + (p > 11 ? s.mb + ' MB' : '') + '</span>';
+  }).join('');
+  $('sizekey').innerHTML = SIZES.map(function (s) {
+    return '<span><i style="background:' + s.c + '"></i>' + s.n + ' ' + s.mb + ' MB</span>';
+  }).join('') + '<span style="color:var(--ink)">합계 ' + fmt(TOT) + ' MB</span>';
+
+  /* ---------- 시작 ---------- */
+  var rz;
+  window.addEventListener('resize', function () {
+    clearTimeout(rz); rz = setTimeout(function () { layout(); paint(); }, 120);
+  });
+  var mq = window.matchMedia('(prefers-color-scheme: dark)');
+  (mq.addEventListener ? mq.addEventListener.bind(mq, 'change') : mq.addListener.bind(mq))(function () { paint(); });
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { layout(); paint(); });
+
+  setW('none');
+  load(0);
+})();
+</script>
+</body>
+</html>
